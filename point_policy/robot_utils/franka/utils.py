@@ -118,6 +118,51 @@ def rigid_transform_3D(A, B):
     return R, t
 
 
+def compute_pinch_orientation(hand_point):
+    """Estimate the hand's world-frame orientation from index/thumb geometry.
+
+    Used only to seed the frame-0 orientation anchor for the relative
+    rigid-transform tracking in convert_pkl_human_to_robot.py — replaces the
+    old assumption that the hand starts at identity orientation in the world
+    frame.
+
+    Priority #1: the index-tip/thumb-tip vector must exactly match the
+    gripper's own finger-separation (Y) axis, since gripper_points.py places
+    tip_L/tip_R symmetrically at +-finger_spread along local Y — so setting
+    world Y to this vector guarantees the two fingertip-to-fingertip lines
+    are exactly parallel. It is used as-is, never adjusted for orthogonality.
+
+    The reach direction (Z) is then derived from the phalange/tip points
+    already used above, and orthogonalized against the now-fixed Y axis —
+    it absorbs any deviation, rather than the fingertip vector.
+
+    hand_point: (9, 3) array in the point order defined by
+    point_policy/point_utils/points_class.py:387-412 —
+    0=wrist 1=idx_MCP 2=idx_PIP 3=idx_DIP 4=idx_TIP
+    5=thm_CMC 6=thm_MCP 7=thm_IP 8=thm_TIP
+
+    Both `spread` and `forward` are defined with a sign flip (thm->idx
+    fingertip rather than idx->thm; tip->phalange rather than phalange->tip):
+    robot_base_orientation (a pi rotation about X) flips the Y and Z columns
+    of whatever gets composed with it, so both must be pre-negated for the
+    final world-frame axes to land in the physically correct direction
+    (Y pointing thumb->index, Z pointing away from the wrist toward the
+    pinch point, as gripper_points.py's extrapoints assume).
+    """
+    idx_phalange, idx_tip = hand_point[1], hand_point[4]
+    thm_phalange, thm_tip = hand_point[5], hand_point[8]
+
+    spread = thm_tip - idx_tip
+    spread = spread / np.linalg.norm(spread)
+
+    forward = (idx_phalange - idx_tip) + (thm_phalange - thm_tip)
+    forward = forward - np.dot(forward, spread) * spread  # orthogonalize
+    forward = forward / np.linalg.norm(forward)
+
+    lateral = np.cross(spread, forward)
+    return np.column_stack([lateral, spread, forward])  # X, Y, Z columns
+
+
 def rotation_6d_to_matrix(d6: np.ndarray) -> np.ndarray:
     """
     Converts 6D rotation representation to rotation matrix

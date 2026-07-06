@@ -8,8 +8,19 @@ import numpy as np
 import pandas as pd
 import pickle as pkl
 import matplotlib
+from dataclasses import dataclass
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
+
+
+# Required for unpickling states.pkl produced by collect_data_realsense.py
+@dataclass
+class DummyState:
+    pos: np.ndarray
+    quat: np.ndarray
+    gripper: np.ndarray
+    timestamp: float
+    start_teleop: bool
 
 # Create the parser
 parser = argparse.ArgumentParser(
@@ -163,6 +174,14 @@ for TASK_NAME in task_names:
                 cam_timestamps = dict(timestamps=image_timestamps)
             # convert to numpy array
             cam_timestamps = np.array(cam_timestamps["timestamps"])
+
+            if not static_timestamps:
+                # All frames are active (start_teleop always True — e.g. DummyState).
+                # No idle trimming needed; keep every frame.
+                valid_indices = list(range(len(cam_timestamps)))
+                CAM_VALID_LENS.append(valid_indices)
+                CAM_TIMESTAMPS.append(cam_timestamps)
+                continue
 
             # # Fish eye cam timestamps are divided by 1000
             if max(cam_timestamps) < state_timestamps[static_timestamps[0][1]]:

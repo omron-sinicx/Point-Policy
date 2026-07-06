@@ -1,0 +1,28 @@
+# Config for collect_data_realsense.py
+#
+# CLI flags always override values here, e.g.:
+#   python ur5e_pipeline/collect_data_realsense.py --task_name pick_cup
+# will use task_name=pick_cup regardless of what's set below.
+
+# Name of the task / demo folder. Required (here or via --task_name).
+task_name: null
+
+# Root data directory. Required (here or via --data_dir).
+data_dir: /root/Point-Policy/data
+
+# Camera serial numbers, in order [cam_1, cam_2].
+#
+# IMPORTANT: this order defines which physical camera is "cam_1" vs "cam_2"
+# for every downstream step (convert_to_pkl_human.py, visualize_reproj.py,
+# ...), and it must match the cam_1/cam_2 assignment baked into
+# calib/calib.npy. Swapping this order silently invalidates calibration —
+# it produces plausible-looking but geometrically wrong 3D triangulation
+# (see the cam_1/cam_2 identity-mismatch issue fixed on 2026-07-03).
+# Do not reorder unless calib.npy is regenerated/relabeled to match.
+cam_serials:
+  - "040322073651"
+  - "143322073893"
+
+width: 640
+height: 480
+fps: 30

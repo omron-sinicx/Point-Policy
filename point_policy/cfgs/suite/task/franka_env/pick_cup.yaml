@@ -1,0 +1,15 @@
+defaults:
+  - _self_
+
+# Example task config for a custom task recorded with 2x RealSense D435 cameras.
+# Duplicate this file for each new task and update the values below.
+
+task_name: pick_cup
+
+# Semantic label(s) passed to DIFT for initial object keypoint detection.
+# Use a descriptive noun phrase that appears in the scene.
+object_labels: [objects]
+
+# How many keypoints to track on the object.
+# Start with 7 and adjust based on the complexity of your object.
+num_object_points: 7

@@ -7,7 +7,7 @@ from scipy.spatial.transform import Rotation as R
 from scipy.ndimage import zoom
 
 from gripper_points import extrapoints, Tshift
-from utils import camera2pixelkey, rigid_transform_3D
+from utils import camera2pixelkey, rigid_transform_3D, compute_pinch_orientation
 
 
 def resize_depth_image(depth_image, new_size):
@@ -106,14 +106,15 @@ for obs_idx, observation in enumerate(DATA["observations"]):
             robot_pos = (hand_point[index_finger_idx] + hand_point[thumb_idx]) / 2
 
             if idx == 0:
-                robot_ori = robot_base_orientation
+                robot_ori_0 = compute_pinch_orientation(hand_point) @ robot_base_orientation
+                robot_ori = robot_ori_0
                 base_hand_points = hand_point.copy()
             else:
                 current_hand_points = hand_point.copy()
                 # find the rotation matrix between the base hand points and the current hand points
                 rot, pos = rigid_transform_3D(base_hand_points, current_hand_points)
 
-                robot_ori = rot @ robot_base_orientation
+                robot_ori = rot @ robot_ori_0
 
             # store human pose
             human_poses.append(
@@ -148,6 +149,17 @@ for obs_idx, observation in enumerate(DATA["observations"]):
         observation[f"object_tracks_3d_{pixel_key}"] = np.array(object_points)
         observation[f"gripper_states"] = np.array(gripper_states)
         observation[f"human_poses"] = np.array(human_poses)
+
+        # TCP (end-effector) pose: same as human_poses but with the position
+        # shifted by Tshift (flange -> TCP), i.e. exactly the position already
+        # stored as robot_tracks_3d_*[:, 0, :]. Orientation is unchanged since
+        # Tshift is a pure translation. This is the pose to actually command
+        # the robot with -- human_poses' position is the pre-Tshift
+        # pinch-point anchor, not a valid end-effector target.
+        observation["robot_tcp_poses"] = np.concatenate(
+            [np.array(robot_points)[:, 0, :], np.array(human_poses)[:, 3:]],
+            axis=1,
+        )
 
         # get 2d robot tracks from 3d robot tracks
         P = calibration_data[camera_name]["ext"]

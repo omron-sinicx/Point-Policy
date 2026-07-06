@@ -89,22 +89,26 @@ class PointsClass:
             self.detect_hand = False
 
         # Set up the correspondence model and find the expert image features
-        self.correspondence_model = Correspondence(
-            device,
-            dift_path,
-            width,
-            height,
-            image_size_multiplier,
-            ensemble_size,
-            dift_layer,
-            dift_steps,
-        )
+        # Only needed when object labels are present (DIFT requires SD 2.1 download)
+        self.correspondence_model = None
+        if len(self.object_labels) > 0:
+            self.correspondence_model = Correspondence(
+                device,
+                dift_path,
+                width,
+                height,
+                image_size_multiplier,
+                ensemble_size,
+                dift_layer,
+                dift_steps,
+            )
 
         self.initial_coords, self.expert_correspondence_features = {}, {}
         for pixel_key in self.pixel_keys:
-            expert_image = Image.open(
-                "%s/coordinates/%s/images/%s.png" % (root_dir, task_name, pixel_key)
-            ).convert("RGB")
+            if len(self.object_labels) > 0:
+                expert_image = Image.open(
+                    "%s/coordinates/%s/images/%s.png" % (root_dir, task_name, pixel_key)
+                ).convert("RGB")
 
             if len(self.object_labels) > 0:
                 for object_label in self.object_labels:

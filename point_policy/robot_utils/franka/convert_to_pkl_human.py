@@ -1,6 +1,9 @@
 import sys
+from pathlib import Path
 
-sys.path.append("../../")
+_here = Path(__file__).resolve().parent
+sys.path.insert(0, str(_here.parents[1]))    # point_policy/ (point_utils, cfgs, …)
+sys.path.insert(0, str(_here))               # franka/utils.py takes priority over point_policy/utils.py
 
 import re
 import yaml
@@ -11,6 +14,8 @@ import cv2
 import torch
 import numpy as np
 from pandas import read_csv
+from scipy.ndimage import median_filter
+from scipy.signal import savgol_filter
 
 from point_utils.points_class import PointsClass
 from utils import (
@@ -81,7 +86,8 @@ for cam_idx in camera_indices:
 
 # Load p3po config for tracking
 if process_points:
-    with open("../../cfgs/suite/points_cfg.yaml") as stream:
+    _cfg_path = Path(__file__).resolve().parents[2] / "cfgs" / "suite" / "points_cfg.yaml"
+    with open(_cfg_path) as stream:
         try:
             cfg = yaml.safe_load(stream)
         except yaml.YAMLError as exc:
@@ -98,8 +104,31 @@ if process_points:
             camera2pixelkey[f"cam_{cam_idx}"] for cam_idx in camera_indices
         ]
         cfg["object_labels"] = object_labels
+        cfg["use_gt_depth"] = use_gt_depth
 
     points_class = PointsClass(**cfg)
+
+
+# 2D track smoothing applied before triangulation.
+# Filtering in 2D before triangulation is important: a single-camera flicker
+# in one frame produces a bad ray, which contaminates the entire triangulated 3D point.
+TRACK_MEDIAN_WINDOW = 5    # frames: removes isolated spike detections
+TRACK_SAVGOL_WINDOW = 11   # frames (odd): smooths continuous jitter
+TRACK_SAVGOL_ORDER  = 3
+
+
+def smooth_2d_tracks(tracks):
+    """Apply median + Savitzky-Golay to (T, N, 2) 2D track array."""
+    T = tracks.shape[0]
+    tracks = tracks.astype(np.float64)
+    win_m = min(TRACK_MEDIAN_WINDOW, T)
+    tracks = median_filter(tracks, size=(win_m, 1, 1))
+    win_s = min(TRACK_SAVGOL_WINDOW, T)
+    win_s = win_s if win_s % 2 == 1 else win_s - 1
+    if win_s >= TRACK_SAVGOL_ORDER + 1:
+        tracks = savgol_filter(tracks, window_length=win_s,
+                               polyorder=TRACK_SAVGOL_ORDER, axis=0)
+    return tracks
 
 
 def extract_number(s):
@@ -343,6 +372,17 @@ for TASK_NAME in task_names:
             """
             Triangulate 3D points from 2D points when gt_depth is not available
             """
+            # Smooth 2D tracks per camera before triangulation so that a
+            # single-camera flicker doesn't corrupt the triangulated 3D point.
+            for cam_idx in camera_indices:
+                camera_name = f"cam_{cam_idx}"
+                pixel_key = camera2pixelkey[camera_name]
+                raw = observation[f"human_tracks_{pixel_key}"]  # (T, N, 2or3)
+                smoothed = smooth_2d_tracks(raw[:, :, :2])       # filter x,y only
+                if raw.shape[2] > 2:                             # preserve depth col if present
+                    smoothed = np.concatenate([smoothed, raw[:, :, 2:]], axis=2)
+                observation[f"human_tracks_{pixel_key}"] = smoothed
+
             for cam_idx in camera_indices:
                 camera_name = f"cam_{cam_idx}"
                 pixel_key = camera2pixelkey[camera_name]
@@ -381,6 +421,18 @@ for TASK_NAME in task_names:
                     point_w_orig = point_w_orig.astype(np.int32)
 
                     pt2d = np.column_stack((point_w_orig, point_h_orig))
+
+                    # Undistort before triangulation: the projection matrix P = K @ E
+                    # assumes undistorted pixel coordinates. Passing raw distorted pixels
+                    # introduces error proportional to lens distortion (especially near
+                    # image edges). cv2.undistortPoints with P=K returns undistorted
+                    # pixel coordinates in the same pixel space.
+                    K_orig = calibration_data[camera_name]["int"]
+                    D_orig = calibration_data[camera_name]["dist_coeff"]
+                    pt2d = cv2.undistortPoints(
+                        pt2d.reshape(-1, 1, 2).astype(np.float32),
+                        K_orig, D_orig, P=K_orig
+                    ).reshape(-1, 2)
 
                     pts.append(pt2d)
 

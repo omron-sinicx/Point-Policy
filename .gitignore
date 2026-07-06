@@ -179,3 +179,5 @@ cython_debug/
 expert_demos/
 coordinates*/
 calib/
+
+data/

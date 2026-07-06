@@ -19,4 +19,4 @@ pip install mediapipe==0.10.11
 pip install  --force-reinstall transformers==4.45.2
 pip install --force-reinstall huggingface_hub==0.25.2
 pip install --force-reinstall numpy==2.1.3
-pip install --force-reinstall torch==2.5.1
+pip install --force-reinstall torch==2.5.0
