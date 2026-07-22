@@ -3,7 +3,7 @@
 	url = git@github.com:mlevy2525/co-tracker.git
 [submodule "dift"]
 	path = dift
-	url = git@github.com:mlevy2525/dift.git
+	url = git@github.com:rogue1starwars/dift.git
 [submodule "Franka-Teach"]
 	path = Franka-Teach
 	url = git@github.com:NYU-robot-learning/Franka-Teach.git
