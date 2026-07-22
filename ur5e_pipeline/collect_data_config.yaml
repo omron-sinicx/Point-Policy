@@ -8,7 +8,7 @@
 task_name: null
 
 # Root data directory. Required (here or via --data_dir).
-data_dir: /root/Point-Policy/data
+data_dir: /root/osx-ur/data
 
 # Camera serial numbers, in order [cam_1, cam_2].
 #

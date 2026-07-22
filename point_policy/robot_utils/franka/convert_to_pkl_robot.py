@@ -87,6 +87,7 @@ if process_points:
         )
         cfg["dift_path"] = f"{root_dir}/{dift_path}"
         cfg["cotracker_checkpoint"] = f"{root_dir}/{cotracker_checkpoint}"
+        cfg["tapir_checkpoint"] = f"{root_dir}/{cfg['tapir_checkpoint']}"
         cfg["task_name"] = task_names[0]
         cfg["pixel_keys"] = [
             camera2pixelkey[f"cam_{cam_idx}"] for cam_idx in camera_indices
@@ -296,8 +297,11 @@ for TASK_NAME in task_names:
                     points_class.track_points(
                         pixel_key, last_n_frames=mark_every, is_first_step=True
                     )
-                except:
-                    print(f"Error in tracking hand points for {pixel_key}")
+                except Exception:
+                    import traceback
+
+                    print(f"Error in tracking hand points for {pixel_key} -- skipping this demo:")
+                    traceback.print_exc()
                     save = False
                     continue
 

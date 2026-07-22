@@ -58,7 +58,8 @@ from scipy.spatial.transform import Rotation as R
 # UPDATE: set the Z offset to match your gripper's flange-to-TCP distance.
 # Positive Z in the flange frame points outward (away from robot).
 # ---------------------------------------------------------------------------
-_flange_to_tcp_z = -0.155  # meters — MEASURE YOUR GRIPPER and set this value
+# _flange_to_tcp_z = -0.155  # meters — MEASURE YOUR GRIPPER and set this value
+_flange_to_tcp_z = -0.165  # meters — MEASURE YOUR GRIPPER and set this value
 
 Tshift = np.array([
     [1, 0, 0, 0],

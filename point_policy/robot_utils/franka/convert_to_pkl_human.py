@@ -18,6 +18,7 @@ from scipy.ndimage import median_filter
 from scipy.signal import savgol_filter
 
 from point_utils.points_class import PointsClass
+from point_utils import task_pkl_io
 from utils import (
     camera2pixelkey,
     pixel2d_to_3d_torch,
@@ -99,6 +100,7 @@ if process_points:
         )
         cfg["dift_path"] = f"{root_dir}/{dift_path}"
         cfg["cotracker_checkpoint"] = f"{root_dir}/{cotracker_checkpoint}"
+        cfg["tapir_checkpoint"] = f"{root_dir}/{cfg['tapir_checkpoint']}"
         cfg["task_name"] = task_names[0]
         cfg["pixel_keys"] = [
             camera2pixelkey[f"cam_{cam_idx}"] for cam_idx in camera_indices
@@ -153,27 +155,43 @@ for TASK_NAME in task_names:
     if use_gt_depth:
         TASK_NAME = f"{TASK_NAME}_gt_depth"
 
-    if (SAVE_DATA_PATH / f"{TASK_NAME}.pkl").exists() and not process_points:
+    # Task pkl is a directory of per-demo files (see point_utils/task_pkl_io.py)
+    # rather than one big pickle -- avoids holding every demo's decoded video
+    # frames in memory simultaneously (OOM risk with enough demos).
+    task_pkl_dir = SAVE_DATA_PATH / TASK_NAME
+
+    if task_pkl_dir.exists() and not process_points:
         print(f"Data for {TASK_NAME} already exists. Appending to it...")
         input("Press Enter to continue...")
-        data = pkl.load(open(SAVE_DATA_PATH / f"{TASK_NAME}.pkl", "rb"))
-        observations = data["observations"]
-        max_cartesian = data["max_cartesian"]
-        min_cartesian = data["min_cartesian"]
-        max_gripper = data["max_gripper"]
-        min_gripper = data["min_gripper"]
+        meta = task_pkl_io.read_meta(task_pkl_dir)
+        max_cartesian = meta["max_cartesian"]
+        min_cartesian = meta["min_cartesian"]
+        max_gripper = meta["max_gripper"]
+        min_gripper = meta["min_gripper"]
+        # Raw (non-tracking) pass only needs to add demos that aren't already
+        # on disk -- existing demo files are never re-read or rewritten.
+        existing_demo_ids = set(task_pkl_io.iter_demo_ids(task_pkl_dir))
     else:
-        observations = []
         max_cartesian, min_cartesian = None, None
         max_gripper, min_gripper = None, None
+        existing_demo_ids = set()
 
     dirs = [x for x in DATASET_PATH.iterdir() if x.is_dir()]
+    # Sort numerically by the trailing demonstration_N id, not lexicographically
+    # as strings (which would order demonstration_10 before demonstration_2).
+    dirs = sorted(dirs, key=lambda p: int(str(p).split("_")[-1]))
 
-    for i, data_point in enumerate(sorted(dirs)):
+    for i, data_point in enumerate(dirs):
         print(f"Processing data point {i+1}/{len(dirs)}")
 
-        if NUM_DEMOS is not None and int(str(data_point).split("_")[-1]) >= NUM_DEMOS:
+        demo_num = int(str(data_point).split("_")[-1])
+
+        if NUM_DEMOS is not None and demo_num >= NUM_DEMOS:
             print(f"Skipping data point {data_point}")
+            continue
+
+        if not process_points and demo_num in existing_demo_ids:
+            print(f"Skipping data point {data_point} (already processed)")
             continue
 
         observation = {}
@@ -259,8 +277,11 @@ for TASK_NAME in task_names:
                     points_class.track_points(
                         pixel_key, last_n_frames=mark_every, is_first_step=True
                     )
-                except:
-                    print(f"Error in tracking hand points for {pixel_key}")
+                except Exception:
+                    import traceback
+
+                    print(f"Error in tracking hand points for {pixel_key} -- skipping this demo:")
+                    traceback.print_exc()
                     points_class.reset_episode()
                     save = False
                     continue
@@ -448,17 +469,13 @@ for TASK_NAME in task_names:
                     observation[f"human_tracks_3d_{pixel_key}"]
                 )
 
-        observations.append(observation)
+        task_pkl_io.write_demo(task_pkl_dir, demo_num, observation)
 
-    # Save data to a pickle file
-    data = {
-        "observations": observations,
+    task_pkl_io.write_meta(task_pkl_dir, {
         "max_cartesian": max_cartesian,
         "min_cartesian": min_cartesian,
         "max_gripper": max_gripper,
         "min_gripper": min_gripper,
-    }
-    with open(SAVE_DATA_PATH / f"{TASK_NAME}.pkl", "wb") as f:
-        pkl.dump(data, f)
+    })
 
 print("Processing complete.")

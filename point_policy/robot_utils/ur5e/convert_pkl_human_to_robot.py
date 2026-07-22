@@ -37,13 +37,13 @@ import sys
 from pathlib import Path
 
 _here = Path(__file__).resolve().parent
+sys.path.insert(0, str(_here.parents[1]))          # point_policy/ (point_utils) -- inserted first, lowest priority
 sys.path.insert(0, str(_here.parent / "franka"))  # franka/utils.py (rigid_transform_3D etc.)
 sys.path.insert(0, str(_here))                     # ur5e/gripper_points.py takes priority over franka's
 
 import cv2
 import argparse
 import numpy as np
-import pickle as pkl
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
 from scipy.ndimage import zoom, median_filter
@@ -51,6 +51,7 @@ from scipy.signal import savgol_filter
 
 from gripper_points import extrapoints, Tshift, robot_base_orientation
 from utils import camera2pixelkey, rigid_transform_3D, compute_pinch_orientation
+from point_utils import task_pkl_io
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +96,7 @@ PINCH_CLOSE_THRESHOLD = 0.07  # meters: fingers closer than this → gripper clo
 MEDIAN_WINDOW = 5        # frames: knocks out single-frame MediaPipe spikes
 SAVGOL_WINDOW = 15       # frames (odd): Savitzky-Golay window — preserves motion peaks
 SAVGOL_ORDER  = 3        # polynomial order for Savitzky-Golay
-GRIPPER_HOLD  = 5        # minimum consecutive frames before gripper state switches
+GRIPPER_HOLD  = 8        # minimum consecutive frames before gripper state switches
 
 if use_gt_depth:
     task_name += "_gt_depth"
@@ -104,7 +105,12 @@ DATA_DIR_PKL = DATA_DIR / "processed_data_pkl"
 SAVE_DIR = DATA_DIR_PKL / "expert_demos" / args.env_name
 
 calibration_data = np.load(CALIB_PATH, allow_pickle=True).item()
-DATA = pkl.load(open(DATA_DIR_PKL / f"{task_name}.pkl", "rb"))
+
+# Task pkls are directories of per-demo files (point_utils/task_pkl_io.py),
+# not one big pickle -- avoids holding every demo's frames in memory at once.
+human_pkl_dir = DATA_DIR_PKL / task_name
+robot_pkl_dir = SAVE_DIR / task_name
+meta = task_pkl_io.read_meta(human_pkl_dir)
 
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -144,6 +150,33 @@ def debounce_gripper(states):
     return out
 
 
+def smooth_rotvec(rotvecs):
+    """Median + Savitzky-Golay filter on a (T,3) rotation-vector sequence.
+
+    rigid_transform_3D can produce noisy per-frame rotation estimates (see
+    smooth_hand_points' docstring above) -- but unlike position, this was
+    never filtered before, even though robot_tcp_poses' orientation (what
+    replay_pkl.py actually commands the real arm with) uses it directly.
+    Filtered via quaternions with sign continuity enforced first: two
+    rotvecs can represent the same rotation with opposite quaternion sign,
+    which would otherwise look like noise to a naive per-component filter.
+    """
+    T = rotvecs.shape[0]
+    quats = R.from_rotvec(rotvecs).as_quat()  # (T,4) [x,y,z,w]
+    for i in range(1, T):
+        if np.dot(quats[i], quats[i - 1]) < 0:
+            quats[i] = -quats[i]
+
+    win_m = min(MEDIAN_WINDOW, T)
+    quats = median_filter(quats.astype(np.float64), size=(win_m, 1))
+    win_s = min(SAVGOL_WINDOW, T)
+    win_s = win_s if win_s % 2 == 1 else win_s - 1
+    if win_s >= SAVGOL_ORDER + 1:
+        quats = savgol_filter(quats, window_length=win_s, polyorder=SAVGOL_ORDER, axis=0)
+    quats /= np.linalg.norm(quats, axis=1, keepdims=True)  # re-normalize after filtering
+    return R.from_quat(quats).as_rotvec()
+
+
 # ---------------------------------------------------------------------------
 # Depth resize helper
 # ---------------------------------------------------------------------------
@@ -156,10 +189,10 @@ def resize_depth_image(depth_image, new_size):
 # ---------------------------------------------------------------------------
 # Process each demonstration
 # ---------------------------------------------------------------------------
-observations = []
+human_demo_ids = task_pkl_io.iter_demo_ids(human_pkl_dir)
 
-for obs_idx, observation in enumerate(DATA["observations"]):
-    print(f"Processing observation {obs_idx + 1}/{len(DATA['observations'])}")
+for obs_idx, (demo_id, observation) in enumerate(task_pkl_io.iter_demos(human_pkl_dir)):
+    print(f"Processing observation {obs_idx + 1}/{len(human_demo_ids)}")
 
     for cam_idx in camera_indices:
         camera_name = f"cam_{cam_idx}"
@@ -186,7 +219,6 @@ for obs_idx, observation in enumerate(DATA["observations"]):
         hand_points_3d = smooth_hand_points(hand_points_3d)      # filter noise
         object_points_3d = human_tracks_3d[:, num_hand_points:]  # (T, N_obj, 3)
 
-        robot_points_list = []
         gripper_states_list = []
         human_poses_list = []
 
@@ -216,43 +248,55 @@ for obs_idx, observation in enumerate(DATA["observations"]):
             human_poses_list.append(
                 np.concatenate([robot_pos, R.from_matrix(robot_ori).as_rotvec()])
             )
+            gripper_states_list.append(-1 if min_dist >= PINCH_CLOSE_THRESHOLD else 1)
 
-            # Build 4×4 gripper pose (TCP in world frame)
+        # Smooth orientation across the whole episode -- rigid_transform_3D's
+        # raw per-frame estimate was never filtered before, even though it
+        # feeds robot_tcp_poses' orientation directly (what replay_pkl.py
+        # commands the real arm with). This is the actual source of jitter
+        # that's most visible at the gripper: a rotation error, applied over
+        # the ~15.5cm Tshift lever arm, becomes an amplified position error
+        # at the fingertips (see smooth_hand_points' call below, which only
+        # ever smoothed that downstream symptom, not the rotation itself).
+        human_poses_arr = np.array(human_poses_list)  # (T, 6)
+        human_poses_arr[:, 3:] = smooth_rotvec(human_poses_arr[:, 3:])
+        gripper_states_debounced = debounce_gripper(gripper_states_list)
+
+        # Rebuild the 9-point gripper geometry from the smoothed orientation
+        # and debounced gripper state (previously built inline per-frame from
+        # the raw, unsmoothed rotation and the raw, undebounced pinch check --
+        # so the visual fingertip narrowing could flicker independently of
+        # the reported gripper_states value).
+        robot_points_list = []
+        for t_idx in range(len(human_poses_arr)):
+            robot_pos = human_poses_arr[t_idx, :3]
+            robot_ori = R.from_rotvec(human_poses_arr[t_idx, 3:]).as_matrix()
+
             T_g_world = np.eye(4)
             T_g_world[:3, :3] = robot_ori
             T_g_world[:3, 3] = robot_pos
+            T_g_world = T_g_world @ Tshift  # flange -> TCP offset
 
-            # Apply flange→TCP offset
-            T_g_world = T_g_world @ Tshift
-
-            # Gripper state from pinch distance
-            gripper_state = -1  # -1 = open
+            is_closed = gripper_states_debounced[t_idx] == 1
             points3d = [T_g_world[:3, 3]]  # center point
-
             for ep_idx, Tp in enumerate(extrapoints):
                 Tp_local = Tp.copy()
-                if min_dist < PINCH_CLOSE_THRESHOLD and ep_idx in [0, 1]:
+                if is_closed and ep_idx in (0, 1):
                     # Close fingers: narrow the fingertip Y spread
                     Tp_local[1, 3] = 0.015 if ep_idx == 0 else -0.015
-                    gripper_state = 1  # 1 = closed
                 pt = T_g_world @ Tp_local
                 points3d.append(pt[:3, 3])
+            robot_points_list.append(np.array(points3d))  # (9, 3)
 
-            robot_points_list.append(np.array(points3d))   # (9, 3)
-            gripper_states_list.append(gripper_state)
-
-        # Smooth robot 3D positions to kill rotation-jitter.
-        # Even after smoothing hand landmarks, rigid_transform_3D can produce
-        # unstable rotation estimates when any landmark has a momentary glitch.
-        # A 3° rotation error applied over the 15.5cm Tshift lever arm moves the
-        # robot center by ~8mm — exactly the jumps we see.  Smoothing the final
-        # robot keypoints removes this without touching the hand data.
+        # Smooth robot 3D positions on top of the now-smoothed rotation, to
+        # kill any remaining position-only noise (e.g. from the pinch-point
+        # anchor itself).
         robot_points_smoothed = smooth_hand_points(np.array(robot_points_list))
 
         observation[f"robot_tracks_3d_{pixel_key}"] = robot_points_smoothed
         observation[f"object_tracks_3d_{pixel_key}"] = object_points_3d
-        observation["gripper_states"] = np.array(debounce_gripper(gripper_states_list))
-        observation["human_poses"] = np.array(human_poses_list)
+        observation["gripper_states"] = np.array(gripper_states_debounced)
+        observation["human_poses"] = human_poses_arr
 
         # TCP (end-effector) pose: same as human_poses but with the position
         # shifted by Tshift (flange -> TCP) and smoothed, i.e. exactly the
@@ -261,7 +305,7 @@ for obs_idx, observation in enumerate(DATA["observations"]):
         # the pose to actually command the robot with -- human_poses' position
         # is the pre-Tshift pinch-point anchor, not a valid end-effector target.
         observation["robot_tcp_poses"] = np.concatenate(
-            [robot_points_smoothed[:, 0, :], np.array(human_poses_list)[:, 3:]],
+            [robot_points_smoothed[:, 0, :], human_poses_arr[:, 3:]],
             axis=1,
         )
 
@@ -295,12 +339,10 @@ for obs_idx, observation in enumerate(DATA["observations"]):
             object_tracks_2d.append(pts2d * scale_xy)
         observation[f"object_tracks_{pixel_key}"] = np.array(object_tracks_2d)
 
-    observations.append(observation)
+    task_pkl_io.write_demo(robot_pkl_dir, demo_id, observation)
 
-DATA["observations"] = observations
+# max/min cartesian & gripper are passed through unchanged from the human pkl
+# -- this script never modifies them.
+task_pkl_io.write_meta(robot_pkl_dir, meta)
 
-output_path = SAVE_DIR / f"{task_name}.pkl"
-with open(output_path, "wb") as f:
-    pkl.dump(DATA, f)
-
-print(f"\nDone. Saved {len(observations)} demonstrations to {output_path}")
+print(f"\nDone. Saved {len(human_demo_ids)} demonstrations to {robot_pkl_dir}")

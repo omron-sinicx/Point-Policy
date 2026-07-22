@@ -2,9 +2,10 @@ defaults:
   - _self_
   - task: p3po
 
-root_dir: /root/Point-Policy
+root_dir: /root/osx-ur/dependencies/Point-Policy
 dift_path: dift
 cotracker_checkpoint: co-tracker/checkpoints/scaled_online.pth
+tapir_checkpoint: tapnet/checkpoints/causal_bootstapir_checkpoint.pt
 
 task_name: null
 pixel_keys: null

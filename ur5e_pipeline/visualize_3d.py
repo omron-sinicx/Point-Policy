@@ -1,12 +1,13 @@
 """
-Interactive 3D visualization: hand keypoints (red) vs robot keypoints (blue).
+Interactive 3D visualization: hand keypoints (red) vs robot keypoints (blue),
+plus tracked object keypoints (green) when the task has them.
 
 Generates a self-contained HTML file you can open in any browser.
 The slider scrubs through frames; 3D scene is fully rotatable/zoomable.
 
 Usage:
     python ur5e_pipeline/visualize_3d.py \\
-        --pkl_path data/processed_data_pkl/expert_demos/franka_env/<task>.pkl
+        --pkl_path data/processed_data_pkl/expert_demos/franka_env/<task>
 
 Options:
     --pkl_path   Path to robot expert_demos pkl          (required)
@@ -16,12 +17,14 @@ Options:
 """
 
 import argparse
-import pickle as pkl
 import sys
 from pathlib import Path
 
 import numpy as np
 import plotly.graph_objects as go
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "point_policy"))
+from point_utils import task_pkl_io
 
 
 # ---------------------------------------------------------------------------
@@ -43,13 +46,13 @@ out_path = Path(args.out_path) if args.out_path else pkl_path.parent / (pkl_path
 # ---------------------------------------------------------------------------
 # Load data
 # ---------------------------------------------------------------------------
-DATA = pkl.load(open(pkl_path, "rb"))
-n_demos = len(DATA["observations"])
+demo_ids = task_pkl_io.iter_demo_ids(pkl_path)
+n_demos = len(demo_ids)
 if args.demo_idx >= n_demos:
     print(f"ERROR: demo_idx={args.demo_idx} but only {n_demos} demos in file.")
     sys.exit(1)
 
-obs = DATA["observations"][args.demo_idx]
+obs = task_pkl_io.read_demo(pkl_path, demo_ids[args.demo_idx])
 
 hand_key  = f"human_tracks_3d_{pixel_key}"
 robot_key = f"robot_tracks_3d_{pixel_key}"
@@ -58,11 +61,25 @@ if hand_key not in obs:
     print(f"ERROR: '{hand_key}' not found. Available keys: {list(obs.keys())}")
     sys.exit(1)
 
-hand_tracks  = np.array(obs[hand_key])    # (T, 9, 3) — hand landmarks
+# human_tracks_3d holds the 9 hand landmarks first, optionally followed by
+# object points (when the task has object labels). This view compares hand vs
+# robot keypoints, so keep only the 9 hand landmarks.
+NUM_HAND_POINTS = 9
+hand_tracks  = np.array(obs[hand_key])[:, :NUM_HAND_POINTS, :]  # (T, 9, 3) — hand landmarks
 robot_tracks = np.array(obs[robot_key])   # (T, 9, 3) — robot body keypoints
 T = hand_tracks.shape[0]
 
-print(f"Demo {args.demo_idx}: {T} frames, camera={args.camera}")
+# Object points (green) — tracked object keypoints, if the task has any.
+object_key = f"object_tracks_3d_{pixel_key}"
+object_tracks = np.array(obs[object_key]) if object_key in obs else None
+HAS_OBJECTS = object_tracks is not None and object_tracks.shape[1] > 0
+n_obj = object_tracks.shape[1] if HAS_OBJECTS else 0
+OBJECT_LABELS = [f"obj_{i}" for i in range(n_obj)]
+
+print(
+    f"Demo {args.demo_idx}: {T} frames, camera={args.camera}"
+    + (f", {n_obj} object points" if HAS_OBJECTS else "")
+)
 
 # ---------------------------------------------------------------------------
 # Skeleton connectivity
@@ -138,6 +155,17 @@ static_traces = [
         hoverinfo="skip",
     ),
 ]
+if HAS_OBJECTS:
+    static_traces.append(
+        go.Scatter3d(
+            x=object_tracks[:, 0, 0], y=object_tracks[:, 0, 1], z=object_tracks[:, 0, 2],
+            mode="lines",
+            line=dict(color="rgba(40,170,80,0.25)", width=2),
+            name="Object point 0 trajectory",
+            showlegend=True,
+            hoverinfo="skip",
+        )
+    )
 N_STATIC = len(static_traces)
 
 # ---------------------------------------------------------------------------
@@ -220,7 +248,30 @@ def make_frame_traces(t):
             hoverinfo="skip",
             marker=dict(size=0, opacity=0),
         ),
-    ]
+    ] + (
+        # 5 — object keypoints (green), only when the task has object points
+        [
+            go.Scatter3d(
+                x=object_tracks[t][:, 0],
+                y=object_tracks[t][:, 1],
+                z=object_tracks[t][:, 2],
+                mode="markers+text",
+                marker=dict(color="green", size=6, symbol="diamond"),
+                text=OBJECT_LABELS,
+                textposition="top center",
+                textfont=dict(size=8, color="darkgreen"),
+                name="Object keypoints",
+                showlegend=True,
+                hovertemplate=(
+                    "<b>%{text}</b><br>"
+                    "x=%{x:.4f} m  y=%{y:.4f} m  z=%{z:.4f} m"
+                    "<extra></extra>"
+                ),
+            )
+        ]
+        if HAS_OBJECTS
+        else []
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +331,10 @@ updatemenus = [dict(
 # ---------------------------------------------------------------------------
 # Axis limits
 # ---------------------------------------------------------------------------
-all_pts = np.concatenate([hand_tracks.reshape(-1, 3), robot_tracks.reshape(-1, 3)])
+_pt_sets = [hand_tracks.reshape(-1, 3), robot_tracks.reshape(-1, 3)]
+if HAS_OBJECTS:
+    _pt_sets.append(object_tracks.reshape(-1, 3))
+all_pts = np.concatenate(_pt_sets)
 pad = 0.05
 x_rng = [all_pts[:, 0].min() - pad, all_pts[:, 0].max() + pad]
 y_rng = [all_pts[:, 1].min() - pad, all_pts[:, 1].max() + pad]

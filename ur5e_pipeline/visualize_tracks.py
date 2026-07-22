@@ -9,23 +9,26 @@ Two modes:
 Usage:
     # Human tracks (side-by-side cam1 | cam2)
     python ur5e_pipeline/visualize_tracks.py \
-        --pkl_path data/processed_data_pkl/07011044_test.pkl \
+        --pkl_path data/processed_data_pkl/07011044_test \
         --out_path data/tracks_vis.mp4 \
         --demo_idx 0
 
     # Robot action keypoints + gripper state
     python ur5e_pipeline/visualize_tracks.py \
-        --pkl_path data/processed_data_pkl/expert_demos/franka_env/07011044_test.pkl \
+        --pkl_path data/processed_data_pkl/expert_demos/franka_env/07011044_test \
         --out_path data/robot_action_vis.mp4 \
         --demo_idx 0 \
         --mode robot
 """
 
 import argparse
-import pickle
+import sys
 import numpy as np
 import cv2
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "point_policy"))
+from point_utils import task_pkl_io
 
 
 # Colors for up to 9 hand/gripper keypoints
@@ -50,6 +53,24 @@ def draw_points(frame_bgr, points_xy, radius=5):
         color = POINT_COLORS[i % len(POINT_COLORS)]
         cv2.circle(out, (x, y), radius, color, -1)
         cv2.circle(out, (x, y), radius + 1, (0, 0, 0), 1)
+    return out
+
+
+OBJECT_COLOR = (255, 0, 255)  # magenta (BGR)
+
+
+def draw_object_points(frame_bgr, points_xy, radius=5):
+    """Overlay object keypoints as magenta squares (distinct from the circular
+    hand/robot markers), labeled by index. points_xy: (N, 2) float array."""
+    out = frame_bgr
+    for i, (x, y) in enumerate(points_xy):
+        x, y = int(round(float(x))), int(round(float(y)))
+        cv2.rectangle(out, (x - radius, y - radius), (x + radius, y + radius),
+                      OBJECT_COLOR, -1)
+        cv2.rectangle(out, (x - radius - 1, y - radius - 1),
+                      (x + radius + 1, y + radius + 1), (0, 0, 0), 1)
+        cv2.putText(out, str(i), (x + radius + 2, y - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, OBJECT_COLOR, 1, cv2.LINE_AA)
     return out
 
 
@@ -79,17 +100,15 @@ def main():
     args = parser.parse_args()
 
     print(f"Loading {args.pkl_path} ...")
-    with open(args.pkl_path, "rb") as f:
-        data = pickle.load(f)
-
-    observations = data["observations"]
-    n_demos = len(observations)
+    task_pkl_dir = Path(args.pkl_path)
+    demo_ids = task_pkl_io.iter_demo_ids(task_pkl_dir)
+    n_demos = len(demo_ids)
     print(f"Found {n_demos} demo(s). Visualizing demo {args.demo_idx} [{args.mode} mode].")
 
     if args.demo_idx >= n_demos:
         raise ValueError(f"demo_idx {args.demo_idx} out of range (only {n_demos} demos)")
 
-    obs = observations[args.demo_idx]
+    obs = task_pkl_io.read_demo(task_pkl_dir, demo_ids[args.demo_idx])
 
     # Determine cameras
     cam_keys = [k for k in ["pixels1", "pixels2"] if k in obs]
@@ -107,10 +126,10 @@ def main():
     # robot pkl only stores frames resized to the training resolution).
     frames_obs = None
     if args.frames_pkl_path:
-        with open(args.frames_pkl_path, "rb") as f:
-            frames_data = pickle.load(f)
-        if args.demo_idx < len(frames_data["observations"]):
-            frames_obs = frames_data["observations"][args.demo_idx]
+        frames_pkl_dir = Path(args.frames_pkl_path)
+        frames_demo_ids = task_pkl_io.iter_demo_ids(frames_pkl_dir)
+        if args.demo_idx < len(frames_demo_ids):
+            frames_obs = task_pkl_io.read_demo(frames_pkl_dir, frames_demo_ids[args.demo_idx])
         else:
             print(f"  Warning: --frames_pkl_path has no demo {args.demo_idx}; "
                   f"falling back to --pkl_path's own frames")
@@ -135,6 +154,16 @@ def main():
         else:
             print(f"  Warning: '{track_key}' not found — no points drawn for {k}")
             tracks_per_cam[k] = None
+
+    # Object keypoints: in robot mode the main tracks are robot_tracks (no
+    # objects), so overlay object_tracks_* separately. In human mode the object
+    # points are already part of human_tracks, so skip to avoid double-drawing.
+    object_tracks_per_cam = {}
+    for k in cam_keys:
+        obj_key = f"object_tracks_{k}"
+        object_tracks_per_cam[k] = (
+            obs[obj_key] if (args.mode == "robot" and obj_key in obs) else None
+        )
 
     # Gripper states (robot mode only)
     gripper_states = None
@@ -164,6 +193,10 @@ def main():
             if tracks_per_cam[k] is not None:
                 pts = tracks_per_cam[k][t, :, :2] * scale_per_cam[k]
                 frame = draw_points(frame, pts)
+
+            if object_tracks_per_cam[k] is not None:
+                obj_pts = object_tracks_per_cam[k][t, :, :2] * scale_per_cam[k]
+                frame = draw_object_points(frame, obj_pts)
 
             # Top label: frame info
             put_label(frame, f"demo {args.demo_idx}  t={t}/{T-1}  {k}")

@@ -10,6 +10,7 @@ import matplotlib.patches as patches
 
 from point_utils.correspondence import Correspondence
 from point_utils.depth import Depth
+from point_utils.tapir_tracker import TapirTracker
 
 
 class PointsClass:
@@ -18,6 +19,7 @@ class PointsClass:
         root_dir,
         dift_path,
         cotracker_checkpoint,
+        tapir_checkpoint,
         task_name,
         pixel_keys,
         device,
@@ -133,17 +135,22 @@ class PointsClass:
         if use_gt_depth:
             self.depth_model = Depth("/path/to/Depth-Anything-V2/", device)
 
-        # Set up cotracker
-        sys.path.append(root_dir + "/co-tracker/")
-        from cotracker.predictor import CoTrackerOnlinePredictor
+        # Set up the point tracker (causal TAPIR). Only needed when there are
+        # object points to track -- hand-only tasks empty object_labels above
+        # and never call the tracker.
+        self.tracker = {}
+        if len(self.object_labels) > 0:
+            for pixel_key in self.pixel_keys:
+                self.tracker[pixel_key] = TapirTracker(
+                    checkpoint=tapir_checkpoint,
+                    device=device,
+                    tapnet_path=root_dir + "/tapnet",
+                )
 
-        # self.cotracker = CoTrackerOnlinePredictor(checkpoint=root_dir + "/co-tracker/checkpoints/scaled_online.pth", window_len=16).to(device)
-        self.cotracker = {}
-        for pixel_key in self.pixel_keys:
-            self.cotracker[pixel_key] = CoTrackerOnlinePredictor(
-                checkpoint=cotracker_checkpoint,
-                window_len=16,
-            ).to(device)
+        # Per-key accumulator of object-point tracks ([N, 2] per processed
+        # frame). Prediction happens at add_to_image_list time, one entry per
+        # genuine frame; track_points assembles self.tracks from this.
+        self._obj_tracks = {pixel_key: [] for pixel_key in self.pixel_keys}
 
         self.transform = transforms.Compose([transforms.PILToTensor()])
         self.image_list = {
@@ -208,6 +215,14 @@ class PointsClass:
                 dim=1,
             )
 
+        # Track object points causally: one TAPIR prediction per genuine frame,
+        # but only once the queries have been initialized (via track_points with
+        # is_first_step=True). This runs once per add_to_image_list call, so the
+        # initial 16x window fill above still yields a single prediction.
+        if key in self.tracker and self.tracker[key].query_features is not None:
+            coords, _ = self.tracker[key].predict(image)
+            self._obj_tracks[key].append(coords)
+
     def reset_episode(self):
         """
         Reset the image list for finding key points.
@@ -223,6 +238,9 @@ class PointsClass:
         }
         self.tracks = {pixel_key: None for pixel_key in self.pixel_keys}
         self.hand_tracks = {pixel_key: None for pixel_key in self.pixel_keys}
+        self._obj_tracks = {pixel_key: [] for pixel_key in self.pixel_keys}
+        for pixel_key in self.tracker:
+            self.tracker[pixel_key].reset()
 
     def find_semantic_similar_points(self, pixel_key, object_label=""):
         """
@@ -345,31 +363,44 @@ class PointsClass:
                     )
                 semantic_similar_points = torch.cat(semantic_similar_points, dim=0)
 
-                self.cotracker[pixel_key](
-                    video_chunk=self.image_list[pixel_key][0, 0]
-                    .unsqueeze(0)
-                    .unsqueeze(0),
-                    is_first_step=True,
-                    add_support_grid=True,
-                    queries=semantic_similar_points[None].to(self.device),
+                # Initialize TAPIR queries from the query frame (frame 0, last
+                # entry of the just-filled window) and its semantic (t, x, y)
+                # correspondence points, then predict frame 0 once.
+                frame0 = (
+                    self.image_list[pixel_key][0, -1]
+                    .cpu()
+                    .numpy()
+                    .transpose(1, 2, 0)
+                    * 255.0
+                ).astype(np.uint8)
+                self.tracker[pixel_key].set_queries(
+                    frame0, semantic_similar_points.cpu().numpy()
                 )
+                coords, _ = self.tracker[pixel_key].predict(frame0)
+                self._obj_tracks[pixel_key].append(coords)
                 self.tracks[pixel_key] = semantic_similar_points
             else:
-                tracks, _ = self.cotracker[pixel_key](
-                    self.image_list[pixel_key], one_frame=one_frame
-                )
-                # Remove the support points
-                tracks = tracks[:, :, 0 : self.num_points, :]
+                # Object tracks were accumulated one-per-frame at add time.
+                # Assemble them into [1, T, N, 2], aligning T to the hand track
+                # length when hand tracking is on so the concat below matches.
+                obj_list = self._obj_tracks[pixel_key]
+                if self.detect_hand:
+                    T = self.hand_tracks[pixel_key].shape[1]
+                    if len(obj_list) < T:
+                        obj_list = [obj_list[0]] * (T - len(obj_list)) + obj_list
+                    else:
+                        obj_list = obj_list[-T:]
+                obj = torch.stack(obj_list, dim=0)[None].to(self.device)
 
                 if self.detect_hand:
                     self.hand_tracks[pixel_key] = self.hand_tracks[pixel_key].to(
-                        tracks.device
+                        self.device
                     )
                     self.tracks[pixel_key] = torch.cat(
-                        [self.hand_tracks[pixel_key], tracks], dim=-2
+                        [self.hand_tracks[pixel_key], obj], dim=-2
                     )
                 else:
-                    self.tracks[pixel_key] = tracks.clone()
+                    self.tracks[pixel_key] = obj
         else:
             self.tracks[pixel_key] = self.hand_tracks[pixel_key]
 
@@ -413,11 +444,16 @@ class PointsClass:
 
                 hand_track = np.array(hand_track)
                 hand_tracks.append(hand_track)
+            elif len(hand_tracks) > 0:
+                hand_tracks.append(hand_tracks[-1])
+            elif self.hand_tracks[pixel_key] is not None:
+                hand_tracks.append(self.hand_tracks[pixel_key][0, -1].cpu())
             else:
-                hand_tracks.append(
-                    hand_tracks[-1]
-                    if len(hand_tracks) > 0
-                    else self.hand_tracks[pixel_key][0, -1].cpu()
+                raise RuntimeError(
+                    f"MediaPipe could not detect a hand in the first frame for "
+                    f"'{pixel_key}', and there is no previous hand track to fall "
+                    f"back on. Make sure the hand is fully visible (not cropped "
+                    f"at the frame edge) in the first frame of this episode."
                 )
         return np.array(hand_tracks)
 

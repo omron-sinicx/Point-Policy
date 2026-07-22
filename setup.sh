@@ -11,6 +11,7 @@ cd ../../
 
 cd dift
 pip install xformers==0.0.29.post1
+pip install accelerate  # required by DIFT's SDFeaturizer (enable_sequential_cpu_offload)
 git checkout main
 cd ../
 
