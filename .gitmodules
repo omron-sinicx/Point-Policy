@@ -1,6 +1,3 @@
-[submodule "co-tracker"]
-	path = co-tracker
-	url = git@github.com:mlevy2525/co-tracker.git
 [submodule "dift"]
 	path = dift
 	url = git@github.com:rogue1starwars/dift.git
