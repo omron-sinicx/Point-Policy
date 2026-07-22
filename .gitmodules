@@ -7,3 +7,12 @@
 [submodule "Franka-Teach"]
 	path = Franka-Teach
 	url = git@github.com:NYU-robot-learning/Franka-Teach.git
+[submodule "tapnet"]
+	path = tapnet
+	url = git@github.com:google-deepmind/tapnet.git
+[submodule "OmniHands"]
+	path = OmniHands
+	url = git@github.com:rogue1starwars/OmniHands.git
+[submodule "hamer"]
+	path = hamer
+	url = git@github.com:omron-sinicx/hamer.git
