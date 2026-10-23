@@ -85,7 +85,8 @@ def main():
     parser = argparse.ArgumentParser(description="Visualize keypoints from pkl")
     parser.add_argument("--pkl_path", required=True)
     parser.add_argument("--out_path", default="tracks_vis.mp4")
-    parser.add_argument("--demo_idx", type=int, default=0)
+    parser.add_argument("--demo_idx", type=int, default=0,
+                    help="Demo ID (the N in demo_NNNN.pkl), not a positional index -- ids are sparse whenever Step 2 skipped a demo.")
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--cam", choices=["1", "2", "both"], default="both")
     parser.add_argument("--mode", choices=["human", "robot"], default="human",
@@ -105,10 +106,13 @@ def main():
     n_demos = len(demo_ids)
     print(f"Found {n_demos} demo(s). Visualizing demo {args.demo_idx} [{args.mode} mode].")
 
-    if args.demo_idx >= n_demos:
-        raise ValueError(f"demo_idx {args.demo_idx} out of range (only {n_demos} demos)")
+    if args.demo_idx not in demo_ids:
+        raise ValueError(
+            f"no demo {args.demo_idx} in {args.pkl_path} "
+            f"({n_demos} demo(s) present: {demo_ids})"
+        )
 
-    obs = task_pkl_io.read_demo(task_pkl_dir, demo_ids[args.demo_idx])
+    obs = task_pkl_io.read_demo(task_pkl_dir, args.demo_idx)
 
     # Determine cameras
     cam_keys = [k for k in ["pixels1", "pixels2"] if k in obs]
@@ -128,8 +132,13 @@ def main():
     if args.frames_pkl_path:
         frames_pkl_dir = Path(args.frames_pkl_path)
         frames_demo_ids = task_pkl_io.iter_demo_ids(frames_pkl_dir)
-        if args.demo_idx < len(frames_demo_ids):
-            frames_obs = task_pkl_io.read_demo(frames_pkl_dir, frames_demo_ids[args.demo_idx])
+        # Match by demo ID, never by position. The two dirs hold DIFFERENT id
+        # sets whenever Step 2 skipped a demo (the robot pkl only has the ones
+        # Step 3 could convert), so a positional lookup silently pairs this
+        # demo's keypoints with a different episode's video frames -- the
+        # overlay then looks plausible but is wrong.
+        if args.demo_idx in frames_demo_ids:
+            frames_obs = task_pkl_io.read_demo(frames_pkl_dir, args.demo_idx)
         else:
             print(f"  Warning: --frames_pkl_path has no demo {args.demo_idx}; "
                   f"falling back to --pkl_path's own frames")

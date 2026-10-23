@@ -37,7 +37,7 @@
 #   ENV_NAME       expert_demos subfolder         (default: franka_env)
 #   NUM_DEMOS      Limit demos processed          (default: all)
 #   VIS_DEMO_IDX   Demo index for visualization, or "all" to visualize every
-#                  episode in the dataset (one output file per demo)   (default: 0)
+#                  episode in the dataset (one output file per demo)   (default: all)
 #   VIS_FPS        Output video FPS               (default: 30)
 #   ANNOTATE       auto (default) — check coordinates/<task>/ and decide:
 #                    if annotation files are missing, stop after producing
@@ -50,9 +50,19 @@
 #   PIXEL_KEYS         Camera pixel keys to check/annotate, space-separated
 #                      (default: "pixels1 pixels2" — must match
 #                      camera_indices in convert_to_pkl_human.py)
-#   ANNOTATED_LABELS   Object labels that require manual coords (default:
-#                      "objects" — human_hand is auto-detected, no
-#                      annotation needed)
+#   ANNOTATED_LABELS   Object label(s) that require manual coords, space-
+#                      separated (default: "objects gripper_orientation" —
+#                      human_hand is auto-detected, no annotation needed).
+#                      label_points.py runs once per label (over every
+#                      PIXEL_KEYS view each time), and the same list is passed
+#                      to Step 2's --object_labels. "gripper_orientation" is
+#                      the group ORIENTATION_METHOD=object_keypoints needs.
+#                      NOTE: because this is checked by annotations_missing(),
+#                      a task annotated only with "objects" (i.e. anything
+#                      labeled before gripper_orientation existed) now counts
+#                      as incomplete and, under ANNOTATE=auto, will stop to
+#                      annotate the missing group. Set
+#                      ANNOTATED_LABELS=objects to get the old behavior.
 #   SKIP_VIDEO     1 (default) — skip step 1. collect_image_data.py (the ROS
 #                    collection script) writes straight into
 #                    processed_data/<task>/demonstration_N/ already, so step 1
@@ -81,6 +91,57 @@
 #                  tracks (see --hand_side on convert_to_pkl_human_hamer.py).
 #                  Empty (default) auto-picks the more confident side. Only
 #                  meaningful when CONVERT_SCRIPT is the HaMeR script.
+#   ORIENTATION_METHOD  Frame-0 orientation estimator used by Step 3
+#                  (see --orientation_method on convert_pkl_human_to_robot.py):
+#                    object_keypoints (default) — Procrustes-aligns >=3 tracked
+#                      "gripper_orientation" object keypoints against a saved
+#                      reference pose, instead of reading the hand at all.
+#                      Reads the grasped object's pose, so it holds up when the
+#                      hand is unreliable (a sustained pinch collapses the
+#                      geometry both hand-based methods depend on). Requires
+#                      ANNOTATED_LABELS to include "gripper_orientation" so
+#                      Step 2 tracks it; the one-time reference is built
+#                      automatically if missing (see REF_* below). Step 3 errors
+#                      out with an actionable message if the task has fewer than
+#                      3 such keypoints -- use ORIENTATION_METHOD=fingertip for
+#                      tasks that were never annotated with them.
+#                    fingertip — single index/thumb-tip vectors. The original
+#                      method; noisy during a sustained pinch.
+#                    plane_fit — fits a plane + level-paired correspondence
+#                      over all 8 finger keypoints; better conditioned than
+#                      fingertip in a pinch, but still hand-based.
+#   REF_DEMO_IDX   Demo id used to build the object_keypoints orientation
+#                  reference, if it doesn't already exist (default: 0).
+#   REF_SEED_METHOD  Hand-based method (fingertip|plane_fit) used to seed the
+#                  reference orientation (default: plane_fit) -- see
+#                  build_orientation_reference.py's --seed_method. Ignored if
+#                  REF_ROTVEC is set.
+#   REF_ROTVEC     Manually specify the reference orientation as a rotation
+#                  vector "RX RY RZ" instead of seeding it from the hand
+#                  (default: empty -- seed from REF_SEED_METHOD). See
+#                  build_orientation_reference.py's --ref_rotvec.
+#   REF_ADJUST_ROTVEC  Small correction rotation "RX RY RZ" (radians, local/
+#                  gripper frame) applied on top of the seeded reference
+#                  orientation (default: empty). Prefer REF_INTERACTIVE=1 over
+#                  guessing this blind. See build_orientation_reference.py's
+#                  --adjust_rotvec. Ignored when REF_INTERACTIVE=1 (the picker
+#                  has sliders instead).
+#   REF_INTERACTIVE  1 — open interactive_orientation_adjust.py and set the
+#                  reference by eye: both camera views, live Roll/Pitch/Yaw
+#                  sliders, "Save Reference" writes the file. Runs even when a
+#                  reference already exists (starting from it), so this is also
+#                  how you re-tune one -- same "1 forces it" convention as
+#                  ANNOTATE=1. Closing the window without saving aborts the run
+#                  rather than silently continuing with a stale/absent
+#                  reference. Needs a display.
+#                  0 (default) — build it non-interactively from REF_SEED_METHOD.
+#   REF_CAMERAS    Camera view(s) the interactive picker shows, space-separated
+#                  (default: "cam_1 cam_2" — both). Both is recommended: a
+#                  single view can't constrain depth along its own optical
+#                  axis, so an orientation can look right in one and be wrong
+#                  in the other.
+#   Except for REF_INTERACTIVE=1, these only apply when building a NEW
+#   reference -- an existing orientation_reference.npz is reused as-is.
 #
 # Annotation workflow (labeling object keypoints partway through the pipeline):
 #   Just run it — if coordinates/pick_cup/ is missing annotation files, the
@@ -108,6 +169,16 @@
 #
 #   # Limit to first 5 demos
 #   NUM_DEMOS=5 bash ur5e_pipeline/run_pipeline.sh pick_cup
+#
+#   # Set the orientation reference by eye in the interactive picker (also the
+#   # way to re-tune an existing reference on a later run)
+#   REF_INTERACTIVE=1 SKIP_PROCESS=1 \
+#     bash ur5e_pipeline/run_pipeline.sh peg_in_hole
+#
+#   # A task with no "gripper_orientation" annotations (e.g. anything labeled
+#   # before that group existed) -- fall back to the hand-based estimators
+#   ANNOTATED_LABELS=objects ORIENTATION_METHOD=plane_fit \
+#     bash ur5e_pipeline/run_pipeline.sh bottle_open_06
 # =============================================================================
 
 set -euo pipefail
@@ -133,13 +204,23 @@ REPO_ROOT="${REPO_ROOT:-$(dirname "$SCRIPT_DIR")}"
 OSX_UR_ROOT="$(cd "$REPO_ROOT/../.." && pwd)"
 DATA_DIR="${DATA_DIR:-$OSX_UR_ROOT/data}"
 CALIB_PATH="${CALIB_PATH:-$REPO_ROOT/calib/calib.npy}"
+# Canonicalize BEFORE anything derives from them (RAW_PKL/COORDS_DIR/... below)
+# and before the -d/-f checks further down. Every step runs in a subshell that
+# cd's into FRANKA_DIR/UR5E_DIR/VIS_DIR first, so a RELATIVE override resolves
+# against a different directory inside the step than it does here: it sails
+# past the existence checks and then dies with a bare FileNotFoundError from
+# numpy, pointing at a path that plainly exists from where you typed it.
+# realpath -m so a not-yet-existing path still normalizes (the checks below
+# are what report that, with a useful message).
+DATA_DIR="$(realpath -m "$DATA_DIR")"
+CALIB_PATH="$(realpath -m "$CALIB_PATH")"
 ENV_NAME="${ENV_NAME:-franka_env}"
 NUM_DEMOS="${NUM_DEMOS:-}"          # empty = process all
-VIS_DEMO_IDX="${VIS_DEMO_IDX:-0}"
+VIS_DEMO_IDX="${VIS_DEMO_IDX:-all}"
 VIS_FPS="${VIS_FPS:-30}"
 ANNOTATE="${ANNOTATE:-auto}"
 PIXEL_KEYS="${PIXEL_KEYS:-pixels1 pixels2}"
-ANNOTATED_LABELS="${ANNOTATED_LABELS:-objects}"
+ANNOTATED_LABELS="${ANNOTATED_LABELS:-objects gripper_orientation}"
 SKIP_PROCESS="${SKIP_PROCESS:-0}"
 SKIP_VIDEO="${SKIP_VIDEO:-1}"
 SKIP_TRACKING="${SKIP_TRACKING:-0}"
@@ -156,6 +237,13 @@ USE_GT_DEPTH="${USE_GT_DEPTH:-0}"
 # flag and would error on it. Useful when ViTPose confuses left/right on a
 # close-up single-hand crop.
 HAND_SIDE="${HAND_SIDE:-}"
+ORIENTATION_METHOD="${ORIENTATION_METHOD:-object_keypoints}"
+REF_DEMO_IDX="${REF_DEMO_IDX:-0}"
+REF_SEED_METHOD="${REF_SEED_METHOD:-plane_fit}"
+REF_ROTVEC="${REF_ROTVEC:-}"
+REF_ADJUST_ROTVEC="${REF_ADJUST_ROTVEC:-}"
+REF_INTERACTIVE="${REF_INTERACTIVE:-0}"
+REF_CAMERAS="${REF_CAMERAS:-cam_1 cam_2}"
 # VITPOSE_ON_GPU: set to 1 to run ViTPose+-Huge (hand bbox localization) on
 # GPU instead of CPU. ViTPose is the per-frame compute bottleneck, so this
 # is much faster, but needs a few extra GB of VRAM -- 8GB is tight alongside
@@ -218,6 +306,16 @@ BODY_DETECTOR_FLAG=""
 # to the OmniHands/MediaPipe scripts (which would error on an unknown arg).
 if [[ -n "$BODY_DETECTOR" && "$CONVERT_SCRIPT" == "convert_to_pkl_human_hamer.py" ]]; then
     BODY_DETECTOR_FLAG="--body_detector $BODY_DETECTOR"
+fi
+
+OBJECT_LABELS_FLAG=""
+# --object_labels only exists on the HaMeR script; guard against passing it
+# to the OmniHands/MediaPipe scripts (which would error on an unknown arg) --
+# same gating as HAND_SIDE_FLAG etc. above. Those scripts fall back to their
+# own hardcoded ["objects"], so ANNOTATED_LABELS additions are silently
+# ignored for them rather than erroring.
+if [[ "$CONVERT_SCRIPT" == "convert_to_pkl_human_hamer.py" ]]; then
+    OBJECT_LABELS_FLAG="--object_labels $ANNOTATED_LABELS"
 fi
 
 VIS_OUT_DIR="$DATA_DIR/vis/${PKL_TASK_NAME}"
@@ -294,6 +392,7 @@ info "CALIB_PATH : $CALIB_PATH"
 info "ENV_NAME   : $ENV_NAME"
 [[ -n "$NUM_DEMOS" ]] && info "NUM_DEMOS  : $NUM_DEMOS"
 [[ "$USE_GT_DEPTH" == "1" ]] && info "GT DEPTH   : enabled"
+info "ORIENTATION_METHOD : $ORIENTATION_METHOD"
 
 # ---------------------------------------------------------------------------
 # Decide whether this run should stop after the raw pkl (for annotation) or
@@ -385,21 +484,25 @@ if [[ "$NEED_ANNOTATION" == "1" ]]; then
             $GT_DEPTH_FLAG \
             $HAND_SIDE_FLAG \
             $VITPOSE_ON_GPU_FLAG \
-            $BODY_DETECTOR_FLAG
+            $BODY_DETECTOR_FLAG \
+            $OBJECT_LABELS_FLAG
     )
 
     echo -e "\n${BOLD}${GREEN}Raw pkl ready:${RESET} $RAW_PKL"
 
     step "Annotate object keypoints — label_points.py"
-    info "A window will open for each camera view ($PIXEL_KEYS)."
-    info "Click the same object point(s) in the same order in every view,"
+    info "A window will open for each camera view ($PIXEL_KEYS), once per label ($ANNOTATED_LABELS)."
+    info "Click the same point(s) in the same order in every view,"
     info "then click 'Save Points' to close that view and move to the next."
     (
         cd "$FRANKA_DIR"
-        python3 label_points.py \
-            --task_name "$PKL_TASK_NAME" \
-            --data_dir "$DATA_DIR" \
-            --pixel_keys $PIXEL_KEYS
+        for LABEL in $ANNOTATED_LABELS; do
+            python3 label_points.py \
+                --task_name "$PKL_TASK_NAME" \
+                --data_dir "$DATA_DIR" \
+                --pixel_keys $PIXEL_KEYS \
+                --label "$LABEL"
+        done
     )
     info "Annotation complete -- continuing with the tracked pass."
 fi
@@ -417,10 +520,74 @@ if [[ "$SKIP_TRACKING" != "1" ]]; then
             $GT_DEPTH_FLAG \
             $HAND_SIDE_FLAG \
             $VITPOSE_ON_GPU_FLAG \
-            $BODY_DETECTOR_FLAG
+            $BODY_DETECTOR_FLAG \
+            $OBJECT_LABELS_FLAG
     )
 else
     info "SKIP_TRACKING=1: skipping step 2"
+fi
+
+# ---------------------------------------------------------------------------
+# Build the object_keypoints orientation reference (auto, if missing)
+# ---------------------------------------------------------------------------
+ORIENTATION_REF_PATH="$COORDS_DIR/orientation_reference.npz"
+if [[ "$ORIENTATION_METHOD" == "object_keypoints" && "$SKIP_CONVERT" != "1" ]]; then
+    REF_ROTVEC_FLAG=""
+    if [[ -n "$REF_ROTVEC" ]]; then
+        REF_ROTVEC_FLAG="--ref_rotvec $REF_ROTVEC"
+    fi
+
+    if [[ "$REF_INTERACTIVE" == "1" ]]; then
+        # Launched even when a reference already exists -- same "1 forces it"
+        # convention as ANNOTATE=1, so this is also how you re-tune one.
+        step "Tune object_keypoints orientation reference — interactive_orientation_adjust.py"
+        info "A window opens with both camera views. Drag Roll/Pitch/Yaw until the"
+        info "gripper lines up in BOTH views, then click 'Save Reference'."
+        FROM_EXISTING_FLAG=""
+        if [[ -f "$ORIENTATION_REF_PATH" ]]; then
+            # Adjust what's already saved rather than re-seeding from the hand.
+            FROM_EXISTING_FLAG="--from_existing"
+            info "Starting from the existing reference."
+        fi
+        (
+            cd "$UR5E_DIR"
+            python3 interactive_orientation_adjust.py \
+                --data_dir "$DATA_DIR" \
+                --calib_path "$CALIB_PATH" \
+                --task_name "$PKL_TASK_NAME" \
+                --ref_demo_idx "$REF_DEMO_IDX" \
+                --seed_method "$REF_SEED_METHOD" \
+                --cameras $REF_CAMERAS \
+                $FROM_EXISTING_FLAG \
+                $REF_ROTVEC_FLAG
+        )
+        # The picker only writes on an explicit "Save Reference" click, so a
+        # closed-without-saving window must not fall through to Step 3 -- it
+        # would either fail confusingly or silently reuse a stale reference.
+        [[ -f "$ORIENTATION_REF_PATH" ]] || die \
+            "No orientation reference at $ORIENTATION_REF_PATH -- the picker was closed without clicking 'Save Reference'."
+        info "Saved → $ORIENTATION_REF_PATH"
+    elif [[ -f "$ORIENTATION_REF_PATH" ]]; then
+        info "Orientation reference already exists: $ORIENTATION_REF_PATH"
+        info "  (set REF_INTERACTIVE=1 to adjust it in the interactive picker)"
+    else
+        step "Build object_keypoints orientation reference — build_orientation_reference.py"
+        REF_ADJUST_ROTVEC_FLAG=""
+        if [[ -n "$REF_ADJUST_ROTVEC" ]]; then
+            REF_ADJUST_ROTVEC_FLAG="--adjust_rotvec $REF_ADJUST_ROTVEC"
+        fi
+        (
+            cd "$UR5E_DIR"
+            python3 build_orientation_reference.py \
+                --data_dir "$DATA_DIR" \
+                --task_name "$PKL_TASK_NAME" \
+                --ref_demo_idx "$REF_DEMO_IDX" \
+                --seed_method "$REF_SEED_METHOD" \
+                $REF_ROTVEC_FLAG \
+                $REF_ADJUST_ROTVEC_FLAG
+        )
+        info "Saved → $ORIENTATION_REF_PATH"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -435,6 +602,8 @@ if [[ "$SKIP_CONVERT" != "1" ]]; then
             --calib_path "$CALIB_PATH" \
             --task_name "$TASK_NAME" \
             --env_name "$ENV_NAME" \
+            --orientation_method "$ORIENTATION_METHOD" \
+            $NUM_DEMOS_FLAG \
             $GT_DEPTH_FLAG
     )
 else
@@ -446,14 +615,23 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "$SKIP_VIS" != "1" ]]; then
     if [[ "$VIS_DEMO_IDX" == "all" ]]; then
-        N_DEMOS=$(python3 -c "
+        # Enumerate the ROBOT pkl's actual demo IDS, not seq 0..N-1. Those
+        # coincide only when no demo was ever dropped: Step 2 skips demos whose
+        # HaMeR/object tracking failed and Step 3 skips the untracked leftovers,
+        # so the surviving ids are sparse (e.g. 2,3,5,6,... for a 76-demo task
+        # that kept 60). Feeding positions where the visualizers expect ids used
+        # to mislabel every output past the first gap -- and worse, made
+        # visualize_tracks.py pair robot keypoints with another episode's frames,
+        # since it indexed the human and robot pkls positionally at once.
+        VIS_DEMO_IDS_RAW=$(python3 -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT/point_policy')
 from point_utils import task_pkl_io
-print(len(task_pkl_io.iter_demo_ids('$ROBOT_PKL')))
+print(' '.join(str(i) for i in task_pkl_io.iter_demo_ids('$ROBOT_PKL')))
 ")
-        VIS_DEMO_INDICES=($(seq 0 $((N_DEMOS - 1))))
-        info "VIS_DEMO_IDX=all: visualizing all $N_DEMOS demo(s)"
+        VIS_DEMO_INDICES=($VIS_DEMO_IDS_RAW)
+        N_DEMOS=${#VIS_DEMO_INDICES[@]}
+        info "VIS_DEMO_IDX=all: visualizing all $N_DEMOS demo(s) [ids: $VIS_DEMO_IDS_RAW]"
     else
         VIS_DEMO_INDICES=("$VIS_DEMO_IDX")
     fi

@@ -37,7 +37,7 @@ dependencies:
     - decord
     - mujoco
     - dm_control
-    - diffusers==0.15.0
+    - diffusers==0.30.3
     - h5py
     - timm
     - blosc
@@ -47,4 +47,4 @@ dependencies:
     - PyOpenGL-accelerate==3.1.7
     - robomimic==0.3.0
     - robosuite==1.4.1
-    - huggingface_hub==0.25.2
+    - huggingface_hub==0.36.2

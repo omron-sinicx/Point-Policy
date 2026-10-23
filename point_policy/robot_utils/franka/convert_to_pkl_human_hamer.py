@@ -7,8 +7,8 @@ to hamer_hand_worker.py running in its own venv (../../../hamer/.hamer_venv
 by default -- override with the HAMER_PYTHON env var), since HaMeR's
 dependencies (old torch/mmcv/detectron2 pins) are incompatible with this
 project's environment. Object-point tracking (DIFT/TAPIR) is untouched --
-PointsClass is instantiated with object_labels=["objects"] only, so it never
-imports MediaPipe.
+PointsClass is instantiated with object_labels from --object_labels (default
+["objects"]) only, so it never imports MediaPipe.
 
 The resulting human_tracks_{pixel_key} array keeps the exact same layout as
 the MediaPipe version: 9 hand points (wrist, index MCP->TIP, thumb CMC->TIP)
@@ -202,6 +202,12 @@ parser.add_argument("--task_names", nargs="+",
 parser.add_argument(
     "--num_demos", type=int, default=None, help="Number of demonstrations to process"
 )
+parser.add_argument(
+    "--demo_ids", nargs="+", type=int, default=None,
+    help="Process ONLY these demo ids (default: all). --num_demos is a prefix "
+         "cutoff and cannot express a sparse set, which is what you need to "
+         "retry just the demos an earlier run dropped."
+)
 parser.add_argument("--process_points", action="store_true",
                     help="Process key points")
 parser.add_argument(
@@ -229,6 +235,15 @@ parser.add_argument(
          "and more accurate ViTDet-H detector (2.77GB checkpoint; needs more "
          "RAM/VRAM headroom).",
 )
+parser.add_argument(
+    "--object_labels", nargs="+", type=str, default=["objects"],
+    help="Label group(s) to track via DIFT+TAPIR, in concatenation order "
+         "(default: objects). Each label needs its own "
+         "coordinates/{task}/coords/{pixel_key}_{label}.pkl, produced by "
+         "label_points.py --label {label}. Add 'gripper_orientation' to also "
+         "track keypoints for the object_keypoints orientation method in "
+         "convert_pkl_human_to_robot.py.",
+)
 
 
 args = parser.parse_args()
@@ -236,6 +251,7 @@ DATA_DIR = Path(args.data_dir)
 CALIB_PATH = Path(args.calib_path)
 task_names = args.task_names
 NUM_DEMOS = args.num_demos
+DEMO_IDS = set(args.demo_ids) if args.demo_ids is not None else None
 process_points = args.process_points
 use_gt_depth = args.use_gt_depth
 
@@ -244,12 +260,10 @@ original_img_size = (640, 480)
 crop_h, crop_w = (0.0, 1.0), (0.0, 1.0)
 save_img_size = None
 # "human_hand" is intentionally absent here -- PointsClass only ever sees
-# "objects", so it never imports MediaPipe. Hand tracking is done separately
-# via detect_hand_tracks_hamer() below and spliced into human_tracks_* in
-# the same 9-points-then-objects layout MediaPipe produced.
-object_labels = [
-    "objects",
-]
+# the labels below, so it never imports MediaPipe. Hand tracking is done
+# separately via detect_hand_tracks_hamer() below and spliced into
+# human_tracks_* in the same 9-points-then-objects layout MediaPipe produced.
+object_labels = args.object_labels
 
 PROCESSED_DATA_PATH = Path(DATA_DIR) / "processed_data"
 SAVE_DATA_PATH = Path(DATA_DIR) / "processed_data_pkl"
@@ -527,6 +541,23 @@ for TASK_NAME in task_names:
         max_cartesian, min_cartesian = None, None
         max_gripper, min_gripper = None, None
         existing_demo_ids = set()
+        if DEMO_IDS is not None and task_pkl_dir.exists():
+            # The meta write at the end REPLACES max/min cartesian & gripper.
+            # Those are a max/min taken across demos, so computing them from
+            # only the --demo_ids subset would shrink the task's normalization
+            # range to whatever those few demos happen to span and silently
+            # mis-normalize every other demo already on disk. Seed from what is
+            # there and let this run widen it -- union, not replacement.
+            try:
+                _existing_meta = task_pkl_io.read_meta(task_pkl_dir)
+                max_cartesian = _existing_meta.get("max_cartesian")
+                min_cartesian = _existing_meta.get("min_cartesian")
+                max_gripper = _existing_meta.get("max_gripper")
+                min_gripper = _existing_meta.get("min_gripper")
+                print(f"--demo_ids: seeded normalization bounds from "
+                      f"{task_pkl_dir}/meta.pkl (this run can only widen them)")
+            except FileNotFoundError:
+                pass
 
     dirs = [x for x in DATASET_PATH.iterdir() if x.is_dir()]
     # Sort numerically by the trailing demonstration_N id, not lexicographically
@@ -564,6 +595,9 @@ for TASK_NAME in task_names:
 
             if NUM_DEMOS is not None and demo_num >= NUM_DEMOS:
                 print(f"Skipping data point {data_point}")
+                continue
+
+            if DEMO_IDS is not None and demo_num not in DEMO_IDS:
                 continue
 
             frames_by_key = load_demo_frames(data_point)
@@ -894,6 +928,9 @@ for TASK_NAME in task_names:
                 print(f"Skipping data point {data_point}")
                 continue
 
+            if DEMO_IDS is not None and demo_num not in DEMO_IDS:
+                continue
+
             if demo_num in existing_demo_ids:
                 print(f"Skipping data point {data_point} (already processed)")
                 continue
@@ -924,11 +961,34 @@ for TASK_NAME in task_names:
 
             task_pkl_io.write_demo(task_pkl_dir, demo_num, observation)
 
-    task_pkl_io.write_meta(task_pkl_dir, {
+    meta_dict = {
         "max_cartesian": max_cartesian,
         "min_cartesian": min_cartesian,
         "max_gripper": max_gripper,
         "min_gripper": min_gripper,
-    })
+    }
+    if process_points:
+        # Record each label's point count, in tracking order, so downstream
+        # (convert_pkl_human_to_robot.py) can slice human_tracks_3d_* back
+        # into per-label blocks without re-reading annotation files. Read
+        # from PointsClass.initial_coords rather than assuming a count --
+        # it's always populated once annotations are loaded, even if every
+        # demo happened to fail tracking.
+        pc = get_points_class()
+        first_pixel_key = _points_cfg["pixel_keys"][0]
+        meta_dict["object_labels"] = object_labels
+        meta_dict["object_label_sizes"] = [
+            pc.initial_coords[f"{first_pixel_key}_{label}"].shape[0]
+            for label in object_labels
+        ]
+    # Merge, don't overwrite. The raw (non-process_points) pass doesn't know
+    # about object_labels/object_label_sizes and omits them above, so a plain
+    # write_meta would wipe those keys off an already-tracked task -- leaving
+    # Step 3 to fall back to "everything past point 9 is objects", which
+    # silently folds the gripper_orientation points into the policy
+    # observation and breaks --orientation_method object_keypoints. The
+    # tracked pass still sets both keys explicitly just above, so it stays
+    # authoritative for them.
+    task_pkl_io.update_meta(task_pkl_dir, meta_dict)
 
 print("Processing complete.")

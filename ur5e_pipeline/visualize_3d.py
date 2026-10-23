@@ -33,7 +33,8 @@ from point_utils import task_pkl_io
 parser = argparse.ArgumentParser()
 parser.add_argument("--pkl_path", required=True)
 parser.add_argument("--out_path", default=None)
-parser.add_argument("--demo_idx", type=int, default=0)
+parser.add_argument("--demo_idx", type=int, default=0,
+                    help="Demo ID (the N in demo_NNNN.pkl), not a positional index.")
 parser.add_argument("--camera", default="cam_1", choices=["cam_1", "cam_2"])
 args = parser.parse_args()
 
@@ -48,11 +49,12 @@ out_path = Path(args.out_path) if args.out_path else pkl_path.parent / (pkl_path
 # ---------------------------------------------------------------------------
 demo_ids = task_pkl_io.iter_demo_ids(pkl_path)
 n_demos = len(demo_ids)
-if args.demo_idx >= n_demos:
-    print(f"ERROR: demo_idx={args.demo_idx} but only {n_demos} demos in file.")
+if args.demo_idx not in demo_ids:
+    print(f"ERROR: no demo {args.demo_idx} in {pkl_path} "
+          f"({n_demos} demo(s) present: {demo_ids}).")
     sys.exit(1)
 
-obs = task_pkl_io.read_demo(pkl_path, demo_ids[args.demo_idx])
+obs = task_pkl_io.read_demo(pkl_path, args.demo_idx)
 
 hand_key  = f"human_tracks_3d_{pixel_key}"
 robot_key = f"robot_tracks_3d_{pixel_key}"

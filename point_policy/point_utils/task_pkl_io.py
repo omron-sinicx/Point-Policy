@@ -47,6 +47,26 @@ def read_meta(task_dir) -> dict:
         return pkl.load(f)
 
 
+def update_meta(task_dir, updates: dict) -> dict:
+    """Merge `updates` into an existing meta.pkl instead of replacing it.
+
+    write_meta() is a full overwrite, so a writer that only knows about some
+    of the keys (e.g. retrack_objects.py, which recomputes tracks but not the
+    normalization bounds) would silently drop the rest. Reads what's there,
+    applies `updates` on top, writes it back. Missing/unreadable meta is
+    treated as empty, so this also works on a task that has none yet.
+
+    Returns the merged dict that was written.
+    """
+    try:
+        meta = read_meta(task_dir)
+    except FileNotFoundError:
+        meta = {}
+    meta.update(updates)
+    write_meta(task_dir, meta)
+    return meta
+
+
 def write_demo(task_dir, demo_id: int, observation: dict) -> None:
     task_dir = Path(task_dir)
     task_dir.mkdir(parents=True, exist_ok=True)

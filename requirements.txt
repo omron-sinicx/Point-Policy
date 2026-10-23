@@ -1,7 +1,7 @@
 # ── Hugging Face ecosystem ────────────────────────────────────────────────────
-diffusers==0.15.0
+diffusers==0.30.3
 transformers==4.45.2
-huggingface_hub==0.25.2
+huggingface_hub==0.36.2
 sentence-transformers
 timm
 

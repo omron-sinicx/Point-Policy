@@ -24,7 +24,13 @@ pip install -r requirements.txt
 
 echo "==> [2/4] dift"
 cd dift
-pip install xformers==0.0.29.post1
+# xformers is intentionally NOT installed here: it can't be built for a
+# torch this new (lerobot forces torch>=~2.6, see the Version pins section
+# below), and a present-but-broken xformers is worse than an absent one --
+# diffusers' is_xformers_available() only checks it's installed, not that
+# it actually loads, so a broken one crashes at import time instead of
+# being cleanly skipped. dift_sd.py's SDFeaturizer already falls back to
+# enable_attention_slicing() when xformers isn't installed.
 pip install accelerate  # required by DIFT's SDFeaturizer (enable_sequential_cpu_offload)
 git checkout main
 cd "$REPO_ROOT"
@@ -39,12 +45,9 @@ echo "==> [4/4] Version pins"
 # this repo's actual version-pinning step, not a fix-up.
 #
 # torch/torchvision are pinned to 2.10.0/0.25.0, NOT the older 2.5.0/0.20.0
-# pair dift/xformers were originally built against -- dependencies/lerobot_v3
-# requires torchvision>=0.21.0 (hence torch>=~2.6), and that constraint wins
-# since lerobot shares this same environment. xformers==0.0.29.post1 (dift,
-# below) doesn't support torch this new and will fail to load at runtime;
-# dift_sd.py's SDFeaturizer catches that and falls back to
-# enable_attention_slicing() (slower but functional) instead of crashing.
+# pair dift was originally built against -- dependencies/lerobot_v3 requires
+# torchvision>=0.21.0 (hence torch>=~2.6), and that constraint wins since
+# lerobot shares this same environment.
 pip install torchvision==0.25.0
 pip install mediapipe==0.10.11
 # transformers/huggingface_hub/numpy are already pinned correctly in

@@ -4,29 +4,54 @@
 ```
 git clone git@github.com:siddhanthaldar/Point-Policy.git --recurse-submodules
 ```
-- Create a conda environment using the provided `conda_env.yaml` file.
-```
-conda env create -f conda_env.yaml
-```
-- Activate the environment using `conda activate point-policy`.
-- Install Franka Teach using the instructions provided in the submodule. If you only want to perform training runs, you can skip setting up the Franka Teach environment and run the following.
-```
-cd Franka-Teach
-pip install -e .
-cd ..
-```
-- Install the Franka environment using the following command.
-```
-cd franka_env
-pip install -e .
-cd ..
-```
+
 - You can download and install the co-tracker and dift submodules and relevant packages by running the setup.sh file. Make sure to run this from the root repository or the models may get installed in the wrong location.
 ```
 sudo chmod 777 setup.sh # make executable
 ./setup.sh
 ```
 
+### TAPIR point tracking (tapnet)
+
+The TAPIR-based tracker (`point_policy/point_utils/tapir_tracker.py`) uses the `tapnet` submodule and is not installed by `setup.sh` yet. Install it and fetch its checkpoint/DIFT weights with:
+```
+pip install -e tapnet
+bash download_tapir_models.sh
+```
+
+### hamer / OmniHands (optional, isolated environments)
+
+`hamer` and `OmniHands` are only used to preprocess human demonstration videos into hand-keypoint tracks (via `convert_to_pkl_human_hamer.py` / `convert_to_pkl_human_omnihands.py`) — they're never imported by the main training/eval code. Their required `torch`/`numpy`/`mmcv` versions conflict with the `point-policy` environment above, so each gets its own venv instead of being installed into it.
+
+**hamer:**
+```
+cd hamer
+python3.10 -m venv .hamer_venv
+.hamer_venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu117  # match your CUDA version
+.hamer_venv/bin/pip install -e .[all]
+.hamer_venv/bin/pip install -v -e third-party/ViTPose
+cd ..
+```
+Then download hamer's checkpoints per [hamer/README.md](../hamer/README.md#installation). Run the worker (from inside `hamer/`) with:
+```
+.hamer_venv/bin/python -I hamer_hand_worker.py --frames_npy /path/to/frames.npy --out_npy /path/to/out.npy
+```
+
+**OmniHands:**
+```
+cd OmniHands
+python3.10 -m venv .omnihands_venv
+.omnihands_venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu117  # match your CUDA version
+.omnihands_venv/bin/pip install -e .[all]
+.omnihands_venv/bin/pip install -v -e third-party/ViTPose
+cd ..
+```
+Then download `Demo_Multiview.pth` per [OmniHands/README.md](../OmniHands/README.md#download-checkpoints) into `OmniHands/checkpoints/`. Run the worker (from inside `OmniHands/`) with:
+```
+.omnihands_venv/bin/python -I omnihands_hand_worker.py --frames_npy /path/to/frames.npy --out_npy /path/to/out.npy
+```
+
+These are deliberately left out of the Docker image/container-init automation (rosdep etc.) since they need their own isolated environments rather than a system-wide install — set them up manually per-machine as needed.
 
 ## Data Collection Instructions
 - Instructions for data collection are provided in the [Franka Teach submodule](Franka-Teach/README.md). This is a fork of [Open Teach](https://github.com/aadhithya14/Open-Teach) modified to only work with Franka robots.

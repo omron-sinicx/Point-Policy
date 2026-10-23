@@ -181,3 +181,6 @@ coordinates*/
 calib/
 
 data/
+
+.claude/
+.vscode/

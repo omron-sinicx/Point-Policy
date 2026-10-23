@@ -87,7 +87,8 @@ def main():
     p.add_argument("--pkl_path",   required=True)
     p.add_argument("--calib_path", required=True)
     p.add_argument("--out_path",   default="reproj_check.mp4")
-    p.add_argument("--demo_idx",   type=int, default=0)
+    p.add_argument("--demo_idx",   type=int, default=0,
+               help="Demo ID (the N in demo_NNNN.pkl), not a positional index -- ids are sparse whenever Step 2 skipped a demo.")
     p.add_argument("--fps",        type=int, default=30)
     p.add_argument("--cam", choices=["1", "2", "both"], default="both")
     args = p.parse_args()
@@ -97,10 +98,10 @@ def main():
     calib = np.load(args.calib_path, allow_pickle=True).item()
 
     n_demos = len(demo_ids)
-    if args.demo_idx >= n_demos:
+    if args.demo_idx not in demo_ids:
         print(
-            f"ERROR: demo_idx={args.demo_idx} but only {n_demos} demo(s) in "
-            f"{args.pkl_path}."
+            f"ERROR: no demo {args.demo_idx} in {args.pkl_path} "
+            f"({n_demos} demo(s) present: {demo_ids})."
             + (
                 " The pkl has 0 demos -- check the tracking step's output for "
                 "'Error in tracking hand points' (demos are dropped when "
@@ -110,7 +111,7 @@ def main():
         )
         sys.exit(1)
 
-    obs   = task_pkl_io.read_demo(task_pkl_dir, demo_ids[args.demo_idx])
+    obs   = task_pkl_io.read_demo(task_pkl_dir, args.demo_idx)
 
     cam_keys = [k for k in ["pixels1", "pixels2"] if k in obs]
     if args.cam == "1":

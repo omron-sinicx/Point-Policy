@@ -50,8 +50,20 @@ from scipy.ndimage import zoom, median_filter
 from scipy.signal import savgol_filter
 
 from gripper_points import extrapoints, Tshift, robot_base_orientation
-from utils import camera2pixelkey, rigid_transform_3D, compute_pinch_orientation
+from utils import camera2pixelkey, rigid_transform_3D
+from utils import compute_pinch_orientation as compute_pinch_orientation_fingertip
+from plane_fit_orientation import compute_pinch_orientation as compute_pinch_orientation_plane_fit
+from orientation_overrides import load_overrides  # noqa: E402
+from object_keypoint_orientation import (
+    compute_orientation as compute_object_keypoint_orientation,
+    load_reference as load_orientation_reference,
+    split_tracks_by_label,
+)
 from point_utils import task_pkl_io
+
+# point_policy/robot_utils/ur5e -> repo root, matching REPO_ROOT in run_pipeline.sh
+REPO_ROOT = _here.parents[2]
+ORIENTATION_LABEL = "gripper_orientation"
 
 
 # ---------------------------------------------------------------------------
@@ -64,12 +76,32 @@ parser.add_argument("--data_dir", type=str, required=True, help="Root data direc
 parser.add_argument("--calib_path", type=str, required=True, help="Path to calib.npy")
 parser.add_argument("--task_name", type=str, required=True, help="Task name")
 parser.add_argument("--use_gt_depth", action="store_true", help="Data was collected with gt depth")
+parser.add_argument("--num_demos", type=int, default=None,
+                    help="Only convert demo ids < this value (matches Step 2's --num_demos "
+                         "convention). Default: all demos found in the human pkl dir.")
 parser.add_argument("--env_name", type=str, default="franka_env",
                     help="Subfolder under expert_demos/ (default: franka_env, keeps training configs intact)")
 parser.add_argument("--save_image_size", nargs=2, type=int, default=[256, 256],
                     metavar=("W", "H"), help="Resize images to this size for training (default: 256 256)")
+parser.add_argument("--orientation_method", type=str, default="fingertip",
+                    choices=["fingertip", "plane_fit", "object_keypoints"],
+                    help="Frame-0 orientation estimator: 'fingertip' (default) uses "
+                         "single index/thumb-tip vectors; 'plane_fit' fits a plane + "
+                         "level-paired correspondence over all 8 finger keypoints, which "
+                         "stays well-conditioned during a sustained pinch (e.g. peg-in-hole); "
+                         "'object_keypoints' Procrustes-aligns N>=3 tracked "
+                         f"'{ORIENTATION_LABEL}' object keypoints against a saved reference "
+                         "pose (see build_orientation_reference.py) -- reads the grasped "
+                         "object's own pose instead of the hand, for tasks where the hand "
+                         "geometry itself is unreliable throughout the whole demo.")
 
 args = parser.parse_args()
+
+compute_pinch_orientation = (
+    compute_pinch_orientation_plane_fit
+    if args.orientation_method == "plane_fit"
+    else compute_pinch_orientation_fingertip
+)
 
 DATA_DIR = Path(args.data_dir)
 CALIB_PATH = Path(args.calib_path)
@@ -103,6 +135,28 @@ if use_gt_depth:
 
 DATA_DIR_PKL = DATA_DIR / "processed_data_pkl"
 SAVE_DIR = DATA_DIR_PKL / "expert_demos" / args.env_name
+
+# Loaded once, up front, rather than per demo -- the reference pose is fixed
+# for the whole task. Fail fast with an actionable message rather than partway
+# through a long run.
+# Per-demo frame-0 corrections, for the handful of demos the task-wide reference
+# gets wrong (see orientation_overrides.py). A demo may override the rotation,
+# the estimator, or both; the layer is inert when the file is absent.
+orientation_overrides = load_overrides(task_name)
+if orientation_overrides:
+    print(f"Loaded {len(orientation_overrides)} per-demo orientation override(s): "
+          f"{sorted(orientation_overrides)}")
+
+# Load the reference if the RUN needs it or if any single demo overrides its way
+# into needing it -- otherwise a task run with --orientation_method fingertip and
+# one "object_keypoints" demo would reach the Procrustes call with ref_pts=None.
+ref_pts = ref_ori = None
+_needs_reference = args.orientation_method == "object_keypoints" or any(
+    ov.get("method") == "object_keypoints" for ov in orientation_overrides.values()
+)
+if _needs_reference:
+    ref_path = REPO_ROOT / "coordinates" / task_name / "orientation_reference.npz"
+    ref_pts, ref_ori = load_orientation_reference(ref_path)
 
 calibration_data = np.load(CALIB_PATH, allow_pickle=True).item()
 
@@ -190,9 +244,36 @@ def resize_depth_image(depth_image, new_size):
 # Process each demonstration
 # ---------------------------------------------------------------------------
 human_demo_ids = task_pkl_io.iter_demo_ids(human_pkl_dir)
+if args.num_demos is not None:
+    # Matches Step 2's `demo_num >= NUM_DEMOS` cutoff -- skips ids the tracked
+    # pass never touched, rather than crashing on their untracked raw pkl.
+    human_demo_ids = [d for d in human_demo_ids if d < args.num_demos]
 
-for obs_idx, (demo_id, observation) in enumerate(task_pkl_io.iter_demos(human_pkl_dir)):
+untracked_demo_ids = []
+
+for obs_idx, demo_id in enumerate(human_demo_ids):
+    observation = task_pkl_io.read_demo(human_pkl_dir, demo_id)
     print(f"Processing observation {obs_idx + 1}/{len(human_demo_ids)}")
+
+    # Step 2 skips (rather than aborts on) any demo whose HaMeR or object
+    # tracking raised -- see convert_to_pkl_human_hamer.py's Phase A/B
+    # `save = False; continue` paths. Those demos keep only the raw pass's
+    # keys (pixels*/cartesian_states/gripper_states), so they have no
+    # human_tracks_3d_* to convert. Skip them with a loud warning instead of
+    # crashing the whole run on the first one, the same way --num_demos
+    # already avoids ids the tracked pass never touched.
+    missing = [
+        camera2pixelkey[f"cam_{cam_idx}"]
+        for cam_idx in camera_indices
+        if f"human_tracks_3d_{camera2pixelkey[f'cam_{cam_idx}']}" not in observation
+    ]
+    if missing:
+        print(
+            f"  WARNING: demo {demo_id} has no human_tracks_3d for {missing} -- "
+            f"Step 2 skipped it (HaMeR or object tracking failed). Not converting."
+        )
+        untracked_demo_ids.append(demo_id)
+        continue
 
     for cam_idx in camera_indices:
         camera_name = f"cam_{cam_idx}"
@@ -217,27 +298,120 @@ for obs_idx, (demo_id, observation) in enumerate(task_pkl_io.iter_demos(human_pk
         human_tracks_3d = observation[f"human_tracks_3d_{pixel_key}"]
         hand_points_3d = human_tracks_3d[:, :num_hand_points]    # (T, 9, 3)
         hand_points_3d = smooth_hand_points(hand_points_3d)      # filter noise
-        object_points_3d = human_tracks_3d[:, num_hand_points:]  # (T, N_obj, 3)
+
+        object_labels_meta = meta.get("object_labels")
+        object_label_sizes_meta = meta.get("object_label_sizes")
+        if object_label_sizes_meta is None:
+            # Backward compat: pkls written before per-label sizes were
+            # recorded -- every remaining point is "objects" (today's exact
+            # behavior), no orientation keypoints.
+            object_labels_meta = ["objects"]
+            object_label_sizes_meta = [human_tracks_3d.shape[1] - num_hand_points]
+
+        object_points_3d, orient_points_3d = split_tracks_by_label(
+            human_tracks_3d, num_hand_points, object_labels_meta, object_label_sizes_meta,
+            orientation_label=ORIENTATION_LABEL,
+        )
+
+        if args.orientation_method == "object_keypoints" and orient_points_3d.shape[1] < 3:
+            raise RuntimeError(
+                f"--orientation_method object_keypoints needs >=3 tracked "
+                f"'{ORIENTATION_LABEL}' keypoints, found {orient_points_3d.shape[1]} for "
+                f"task '{task_name}'. Annotate them (label_points.py --label "
+                f"{ORIENTATION_LABEL}) and re-run Step 2 with --object_labels objects "
+                f"{ORIENTATION_LABEL} first."
+            )
 
         gripper_states_list = []
         human_poses_list = []
 
+        # ------------------------------------------------------------------
+        # Pick ONE index/thumb pair to anchor the TCP for the whole episode.
+        #
+        # The TCP anchor is the midpoint of a selected landmark pair, so ANY
+        # change of selection teleports it -- the landmarks are far apart
+        # (index 3 vs 4 ~32mm, thumb 7 vs 8 similar), and half that gap lands
+        # straight in the anchor. A per-frame argmin re-decides independently
+        # every frame, so during a sustained pinch (peg-in-hole) the two
+        # smallest distances stay nearly tied and the choice flip-flops:
+        # measured 102 jumps of 15-17mm across peg_hole_dir1_03's 50 demos,
+        # crossing on margins as small as 0.08mm. Savitzky-Golay below then
+        # smears each step into a smooth ~20-frame excursion, so it reads as
+        # deliberate motion rather than an obvious spike.
+        #
+        # Per-frame hysteresis was tried first and is NOT sufficient: a
+        # decisive switch (margin > threshold) still teleports the anchor, and
+        # real data produced 22-29mm jumps at margins of 5-10mm. The anchor
+        # has to be a single consistent physical point instead. A constant
+        # offset from the "ideal" pair is harmless -- the policy absorbs it --
+        # whereas a mid-episode teleport is spurious motion it would learn.
+        #
+        # Chosen by smallest MEDIAN distance over the episode (robust to a few
+        # bad frames), i.e. the pair that is most consistently the pinch.
+        # ------------------------------------------------------------------
+        pair_dists = np.array([
+            [np.linalg.norm(hp[i1] - hp[i2]) for i1, i2 in index_finger_thumb_pairs]
+            for hp in hand_points_3d
+        ])                                        # (T, 4)
+        locked_pair_idx = int(np.argmin(np.median(pair_dists, axis=0)))
+        i_idx, th_idx = index_finger_thumb_pairs[locked_pair_idx]
+
+        # Diagnostic: if the per-frame argmin disagrees often, the grasp really
+        # does move during the demo, so the locked anchor carries a varying
+        # offset. Still preferable to teleporting, but worth surfacing.
+        disagree = np.mean(np.argmin(pair_dists, axis=1) != locked_pair_idx)
+        if disagree > 0.25:
+            print(
+                f"  demo {demo_id} {pixel_key}: anchor pair locked to "
+                f"{index_finger_thumb_pairs[locked_pair_idx]}, but the per-frame "
+                f"closest pair differs on {disagree * 100:.0f}% of frames -- "
+                f"grasp point may shift during this demo."
+            )
+
         for t_idx, hand_point in enumerate(hand_points_3d):
-            # Pinch detection: find closest index-thumb pair
-            dists = [
-                np.linalg.norm(hand_point[i1] - hand_point[i2])
-                for i1, i2 in index_finger_thumb_pairs
-            ]
-            min_dist = np.min(dists)
-            min_pair_idx = int(np.argmin(dists))
-            i_idx, th_idx = index_finger_thumb_pairs[min_pair_idx]
+            # Gripper open/closed still uses the per-frame closest pair over
+            # ALL pairs -- that's a question about whether the fingers are
+            # together, independent of which pair anchors the TCP.
+            min_dist = float(pair_dists[t_idx].min())
 
             # TCP center = midpoint between chosen finger and thumb
             robot_pos = (hand_point[i_idx] + hand_point[th_idx]) / 2.0
 
             # Orientation: rigid transform relative to the first frame
             if t_idx == 0:
-                robot_ori_0 = compute_pinch_orientation(hand_point) @ robot_base_orientation
+                _ov = orientation_overrides.get(demo_id, {})
+                # A demo may pick a different estimator than the run: object
+                # keypoints only anchor the gripper when the object is actually
+                # held at frame 0, so a demo that opens mid-reach is better
+                # served by the hand-based methods.
+                _method = _ov.get("method") or args.orientation_method
+                if _method == "object_keypoints":
+                    # Already final -- do NOT compose with robot_base_orientation
+                    # again (see object_keypoint_orientation.py's docstring).
+                    robot_ori_0 = compute_object_keypoint_orientation(
+                        orient_points_3d[0], ref_pts, ref_ori
+                    )
+                else:
+                    _fn = (compute_pinch_orientation_plane_fit
+                           if _method == "plane_fit" else compute_pinch_orientation_fingertip)
+                    robot_ori_0 = _fn(hand_point) @ robot_base_orientation
+
+                # Per-demo correction, right-multiplied so it is a rotation in
+                # the gripper's OWN frame -- same convention as the picker's
+                # sliders and build_orientation_reference.py's --adjust_rotvec.
+                # Applied to robot_ori_0 only: every later frame is the hand's
+                # rigid motion composed onto it, so correcting frame 0 corrects
+                # the whole episode.
+                _delta = _ov.get("rotvec")
+                if _delta is not None:
+                    robot_ori_0 = robot_ori_0 @ R.from_rotvec(_delta).as_matrix()
+                if _ov and cam_idx == camera_indices[0]:
+                    _bits = []
+                    if _ov.get("method"):
+                        _bits.append(f"method={_ov['method']}")
+                    if _delta is not None:
+                        _bits.append(f"rotvec={np.round(_delta, 5)}")
+                    print(f"  demo {demo_id}: orientation override ({', '.join(_bits)})")
                 robot_ori = robot_ori_0
                 base_hand_points = hand_point.copy()
             else:
@@ -345,4 +519,12 @@ for obs_idx, (demo_id, observation) in enumerate(task_pkl_io.iter_demos(human_pk
 # -- this script never modifies them.
 task_pkl_io.write_meta(robot_pkl_dir, meta)
 
-print(f"\nDone. Saved {len(human_demo_ids)} demonstrations to {robot_pkl_dir}")
+num_saved = len(human_demo_ids) - len(untracked_demo_ids)
+print(f"\nDone. Saved {num_saved} demonstrations to {robot_pkl_dir}")
+if untracked_demo_ids:
+    print(
+        f"WARNING: skipped {len(untracked_demo_ids)} untracked demo(s): "
+        f"{untracked_demo_ids}\n"
+        f"  Step 2 failed on these. Re-run Step 2 (SKIP_TRACKING=0) and read its "
+        f"'Error in ...' tracebacks to recover them."
+    )
